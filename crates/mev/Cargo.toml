@@ -1,0 +1,58 @@
+[package]
+name = "reth-mev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chain-state.workspace = true
+reth-chainspec.workspace = true
+reth-errors.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-network-api.workspace = true
+reth-rpc.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-convert.workspace = true
+reth-rpc-eth-api.workspace = true
+reth-rpc-eth-types.workspace = true
+reth-rpc-server-types.workspace = true
+reth-storage-api.workspace = true
+reth-revm.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-evm.workspace = true
+alloy-network.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-rpc-types-trace.workspace = true
+
+# revm
+revm.workspace = true
+revm-inspectors.workspace = true
+
+# rpc
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+
+# async + concurrency
+async-trait.workspace = true
+crossbeam-channel.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+# misc
+eyre.workspace = true
+metrics.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

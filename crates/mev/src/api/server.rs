@@ -188,6 +188,8 @@ where
         request: TransactionRequest,
         trace_types: Vec<TraceType>,
         block_id: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<TraceResults> {
         let trace_types: HashSet<_> = trace_types.into_iter().collect();
 
@@ -197,8 +199,8 @@ where
                 request,
                 trace_types,
                 block_id,
-                None,
-                None,
+                state_overrides,
+                block_overrides,
             )
             .await;
         }
@@ -213,8 +215,8 @@ where
             epoch,
             evm_env,
             tx_env,
-            block_overrides: None,
-            state_overrides: None,
+            block_overrides,
+            state_overrides,
             kind: CallKind::ParityTrace { trace_types },
             result_tx,
         };

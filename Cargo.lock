@@ -9043,7 +9043,7 @@ dependencies = [
 
 [[package]]
 name = "reth-mev"
-version = "1.11.1"
+version = "1.11.3"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

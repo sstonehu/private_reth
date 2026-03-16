@@ -37,5 +37,7 @@ pub trait MevApi {
         request: TransactionRequest,
         trace_types: Vec<TraceType>,
         block_id: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
     ) -> jsonrpsee::core::RpcResult<TraceResults>;
 }

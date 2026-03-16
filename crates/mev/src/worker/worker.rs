@@ -2,9 +2,10 @@ use super::{cache::WorkerL1Cache, EthTxEnv, WorkerError, WorkerOutput, WorkerTas
 use crate::{api::types::CallKind, epoch::EpochContext, provider::WorkerStateProvider};
 use alloy_primitives::map::HashSet;
 use crossbeam_channel::Receiver;
-use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm};
+use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm, TransactionEnv};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
+use revm::Database as _;
 use revm::context_interface::result::ExecutionResult;
 use revm_inspectors::tracing::{DebugInspector, TracingInspector, TracingInspectorConfig};
 use std::sync::Arc;
@@ -116,18 +117,28 @@ impl MevWorker {
                 .map_err(|err| WorkerError::Internal(err.to_string()))?;
         }
 
+        // Align with native `prepare_call_env`: nonce is taken from state after request nonce is
+        // cleared in API preprocessing.
+        let mut tx_env = task.tx_env.clone();
+        let state_nonce = db
+            .basic(tx_env.caller)
+            .map_err(|err| WorkerError::Internal(err.to_string()))?
+            .map(|acc| acc.nonce)
+            .unwrap_or_default();
+        tx_env.set_nonce(state_nonce);
+
         let evm_config = self.evm_config.clone();
 
         match &task.kind {
-            CallKind::Basic => Self::exec_basic(&evm_config, &mut db, evm_env, task.tx_env.clone()),
+            CallKind::Basic => Self::exec_basic(&evm_config, &mut db, evm_env, tx_env),
             CallKind::DebugTrace { opts } => {
-                Self::exec_debug_trace(&evm_config, &mut db, evm_env, task.tx_env.clone(), opts)
+                Self::exec_debug_trace(&evm_config, &mut db, evm_env, tx_env, opts)
             }
             CallKind::ParityTrace { trace_types } => Self::exec_parity_trace(
                 &evm_config,
                 &mut db,
                 evm_env,
-                task.tx_env.clone(),
+                tx_env,
                 trace_types,
             ),
         }

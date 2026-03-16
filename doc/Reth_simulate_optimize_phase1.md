@@ -1795,3 +1795,22 @@ cargo check -p reth-mev
 → warning count: 0
 → error count:   0
 ```
+
+---
+
+### 17.9 剩余问题清单（追加）
+
+> 仅记录当前实现与原生路径的剩余差异，不改动前文设计定义。  
+> 说明：`pending` 语义差异按业务约束“不会传 `pending`”暂不纳入本清单。
+
+| 编号 | 问题 | 当前优先级 | 现状说明 |
+|---|---|---|---|
+| R1 | `mev_debug_traceCall` 未实现 `tx_index` 语义 | 🟢 低 | 当前不会指定 `tx_index`，默认在 block 尾部模拟；与现网使用方式一致。若后续需要中间状态 trace，再补 replay 到 `tx_index` 的执行路径。 |
+| R2 | `prepare_call_env` 与原生仍有细节差异 | 🟡 中 | 当前已覆盖核心预处理（gas cap、nonce clear、overrides、memory limit），但未完整复刻原生 `prepare_call_env` 的全部边界逻辑（如 request_has_gas_limit 分支下的部分限制策略）。 |
+| R3 | Worker 路径错误码映射较粗 | 🟡 中 | 当前 `mev_*` 对部分执行异常仍通过 `internal_rpc_err(...)` 返回；原生路径会映射为更细粒度的 `EthApiError` / RPC 错误码。 |
+| R4 | `latest` 取状态时点与原生可能有微小时序差 | 🟡 中 | 当前走 `EpochManager` 活跃快照；原生按请求时点即时取 env/state。极端并发/重组窗口下，返回值可能存在短暂时序差异。 |
+
+#### 备注（已解决项）
+
+- `trace_call` 参数能力弱于原生（缺失 `state_overrides` / `block_overrides`）已修复并完成编译验证。  
+- `mev_debug_traceCall` 的 nonce 回填问题（`NonceTooLow { tx: 0, state: N }`）已修复并完成编译验证。

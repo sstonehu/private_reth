@@ -6,8 +6,11 @@
 //!
 //! 使用 [`install_mev_rpc`] 将模块挂载到 Reth 的 `extend_rpc_modules` 钩子。
 #![allow(missing_docs)]
+#![allow(clippy::doc_markdown, clippy::missing_const_for_fn)]
+#![allow(clippy::module_inception, clippy::large_enum_variant)]
 
 pub mod api;
+pub mod cache;
 pub mod epoch;
 pub mod metrics;
 pub mod provider;
@@ -18,6 +21,7 @@ use crate::{
         server::{MevApiServer as MevServer, MevCallConfig},
         MevApiServer as _,
     },
+    cache::GlobalSharedCache,
     epoch::EpochManager,
     metrics::MevCounters,
     worker::{MevWorkerPool, DEFAULT_POOL_SIZE},
@@ -89,7 +93,12 @@ where
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_POOL_SIZE);
-    let worker_pool = MevWorkerPool::new(num_workers, evm_config);
+    let cache_max_mb = std::env::var("MEV_GLOBAL_CACHE_MAX_MB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(16_384);
+    let global_cache = GlobalSharedCache::new(cache_max_mb);
+    let worker_pool = MevWorkerPool::new(num_workers, evm_config, global_cache.clone());
 
     // Shared counters: passed into server for per-request recording and into the
     // periodic reporter for delta-based log summaries.
@@ -100,6 +109,7 @@ where
         .unwrap_or(30);
     metrics::spawn_periodic_reporter(
         counters.clone(),
+        global_cache,
         std::time::Duration::from_secs(stats_interval_secs),
     );
 
@@ -118,9 +128,10 @@ where
     tracing::info!(
         target: "reth::mev",
         num_workers,
+        cache_max_mb,
         call_gas_cap = call_config.call_gas_cap,
         stats_interval_secs,
-        "mev RPC module installed (mev_eth_call / mev_debug_traceCall / mev_trace_call)"
+        "mev RPC module installed (Phase 2: GlobalSharedCache enabled)"
     );
 
     Ok(())

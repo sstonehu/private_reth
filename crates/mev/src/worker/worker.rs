@@ -1,5 +1,10 @@
 use super::{cache::WorkerL1Cache, EthTxEnv, WorkerError, WorkerOutput, WorkerTask};
-use crate::{api::types::CallKind, epoch::EpochContext, provider::WorkerStateProvider};
+use crate::{
+    api::types::CallKind,
+    cache::{GlobalSharedCache, SafeUnchangedSet},
+    epoch::EpochContext,
+    provider::CachedStateProvider,
+};
 use alloy_primitives::map::HashSet;
 use crossbeam_channel::Receiver;
 use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm, TransactionEnv};
@@ -17,6 +22,7 @@ pub struct MevWorker {
     l1: WorkerL1Cache,
     current_epoch_id: u64,
     state_provider: Option<reth_storage_api::StateProviderBox>,
+    global_cache: Arc<GlobalSharedCache>,
 }
 
 impl std::fmt::Debug for MevWorker {
@@ -29,13 +35,14 @@ impl std::fmt::Debug for MevWorker {
     }
 }
 
-type WorkerStateDb<'a> = State<WorkerStateProvider<'a>>;
+type WorkerStateDb<'a> = State<CachedStateProvider<'a>>;
 
 impl MevWorker {
     pub fn spawn(
         id: usize,
         task_rx: Receiver<WorkerTask>,
         evm_config: EthEvmConfig,
+        global_cache: Arc<GlobalSharedCache>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name(format!("mev-worker-{id}"))
@@ -47,6 +54,7 @@ impl MevWorker {
                     l1: WorkerL1Cache::new(0),
                     current_epoch_id: 0,
                     state_provider: None,
+                    global_cache,
                 };
                 worker.run();
             })
@@ -76,6 +84,7 @@ impl MevWorker {
         self.state_provider = Some(provider);
         self.l1.reset(epoch.epoch_id);
         self.current_epoch_id = epoch.epoch_id;
+        self.global_cache.eager_prefetch(epoch.epoch_id, &SafeUnchangedSet::empty());
 
         tracing::debug!(
             target: "reth::mev::worker",
@@ -95,8 +104,10 @@ impl MevWorker {
             .as_ref()
             .ok_or_else(|| WorkerError::Internal("state provider missing".to_string()))?;
 
-        let worker_provider = WorkerStateProvider {
+        let worker_provider = CachedStateProvider {
             l1: &mut self.l1,
+            global: self.global_cache.clone(),
+            epoch_id: self.current_epoch_id,
             db: StateProviderDatabase::new(state_provider),
         };
 

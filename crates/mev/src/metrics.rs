@@ -1,3 +1,4 @@
+use crate::cache::GlobalSharedCache;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -149,7 +150,11 @@ pub mod method {
 ///   eth_call.degraded=6  eth_call.degraded_pct=10  eth_call.errors=0
 ///   ...
 /// ```
-pub fn spawn_periodic_reporter(counters: Arc<MevCounters>, interval: Duration) {
+pub fn spawn_periodic_reporter(
+    counters: Arc<MevCounters>,
+    global_cache: Arc<GlobalSharedCache>,
+    interval: Duration,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // skip the immediate first tick
@@ -201,6 +206,13 @@ pub fn spawn_periodic_reporter(counters: Arc<MevCounters>, interval: Duration) {
                 .set(d_dbg.degraded_pct() as f64);
             metrics::gauge!("mev_degraded_pct", "method" => method::TRACE_CALL)
                 .set(d_trc.degraded_pct() as f64);
+
+            metrics::gauge!("mev_global_cache_entry_count", "sub" => "account")
+                .set(global_cache.account_entry_count() as f64);
+            metrics::gauge!("mev_global_cache_entry_count", "sub" => "storage")
+                .set(global_cache.storage_entry_count() as f64);
+            metrics::gauge!("mev_global_cache_entry_count", "sub" => "bytecode")
+                .set(global_cache.bytecode_entry_count() as f64);
 
             prev_eth = cur_eth;
             prev_dbg = cur_dbg;

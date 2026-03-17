@@ -54,5 +54,6 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 # misc
 eyre.workspace = true
 metrics.workspace = true
+moka = { version = "0.12", features = ["sync"] }
 thiserror.workspace = true
 tracing.workspace = true

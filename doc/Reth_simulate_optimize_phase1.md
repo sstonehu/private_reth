@@ -1814,3 +1814,287 @@ cargo check -p reth-mev
 
 - `trace_call` 参数能力弱于原生（缺失 `state_overrides` / `block_overrides`）已修复并完成编译验证。  
 - `mev_debug_traceCall` 的 nonce 回填问题（`NonceTooLow { tx: 0, state: N }`）已修复并完成编译验证。
+
+---
+
+### 17.10 统计指标设计（已完成）
+
+> 目标：对 `mev_eth_call` / `mev_debug_traceCall` / `mev_trace_call` 三个接口的访问量、进入新接口的数量、降级数量进行周期统计。
+
+#### 17.10.1 指标体系
+
+##### Prometheus 计数器（可供 Grafana 抓取）
+
+| 指标名 | 类型 | Labels | 语义 |
+|---|---|---|---|
+| `mev_requests_total` | Counter | `method` | 进入 mev_* 接口的请求总数 |
+| `mev_worker_path_total` | Counter | `method` | 路由到 Worker Pool（新接口路径）的请求数 |
+| `mev_degraded_path_total` | Counter | `method` | 降级到原生 eth_call / debug / trace 的请求数 |
+| `mev_errors_total` | Counter | `method`, `kind` | Worker 执行出错数（`kind`: `worker_error` / `worker_dropped`） |
+| `mev_e2e_duration_seconds` | Histogram | `method` | 端到端延迟（从 API 入口到返回结果） |
+| `mev_degraded_pct` | Gauge | `method` | 最近报告周期内降级比例（%）|
+
+`method` label 取值：`eth_call` / `debug_traceCall` / `trace_call`。
+
+##### 周期性 tracing log（`reth::mev::stats`）
+
+每隔 `MEV_STATS_INTERVAL_SECS`（默认 30 秒）向 `tracing` 输出一条结构化日志，包含：
+
+- 累计总量（`total`）
+- 本周期增量（`delta`）
+- 本周期进入 Worker 路径数（`worker`）
+- 本周期降级数（`degraded`）
+- 本周期降级比例（`degraded_pct`，整数 %）
+- 本周期错误数（`errors`）
+
+示例输出：
+```
+INFO reth::mev::stats  mev periodic stats
+  eth_call_total=1234  eth_call_delta=56  eth_call_worker=50
+  eth_call_degraded=6  eth_call_degraded_pct=10  eth_call_errors=0
+  debug_trace_total=89  debug_trace_delta=5  ...
+```
+
+#### 17.10.2 实现文件
+
+| 文件 | 变更内容 |
+|---|---|
+| `crates/mev/src/metrics.rs` | **新建**：`MethodCounters`（AtomicU64）、`MevCounters`、`record_*` 埋点函数、`spawn_periodic_reporter` |
+| `crates/mev/src/api/server.rs` | `MevApiServer` 增加 `counters: Arc<MevCounters>` 字段；三个方法均在入口、降级分支、Worker 分支、错误处理处调用 `record_*`；通过 `Instant::now()` 记录 E2E 延迟 |
+| `crates/mev/src/lib.rs` | 声明 `pub mod metrics`；`install_mev_rpc` 中创建 `MevCounters::new()`，传入 `MevServer` 构造，并调用 `metrics::spawn_periodic_reporter` 启动后台报告任务 |
+
+#### 17.10.3 可配置参数
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `MEV_STATS_INTERVAL_SECS` | `30` | 周期 log 间隔（秒） |
+| `MEV_WORKER_COUNT` | `DEFAULT_POOL_SIZE` | Worker 数量（已有） |
+
+#### 17.10.4 已实现指标完整清单
+
+##### A. Prometheus 指标（通过 `--metrics` 端口暴露）
+
+> 端口示例：`http://0.0.0.0:9002/metrics`（对应 systemd service 中 `--metrics 0.0.0.0:9002`）
+
+| 指标名 | 类型 | Labels | 埋点位置 | 语义 |
+|---|---|---|---|---|
+| `mev_requests_total` | Counter | `method` | `server.rs` — 每个 mev_* 方法入口 | 进入 mev_* 接口的请求总数 |
+| `mev_worker_path_total` | Counter | `method` | `server.rs` — epoch 匹配成功后 | 路由到 Worker Pool 的请求数 |
+| `mev_degraded_path_total` | Counter | `method` | `server.rs` — epoch 不匹配分支 | 降级到原生接口的请求数 |
+| `mev_errors_total` | Counter | `method`, `kind` | `server.rs` — worker 返回错误处 | Worker 执行错误数；`kind`=`worker_error`/`worker_dropped` |
+| `mev_e2e_duration_seconds` | Histogram | `method` | `server.rs` — 方法出口（含降级路径） | API 入口到返回结果的端到端延迟（秒） |
+| `mev_degraded_pct` | Gauge | `method` | `metrics.rs` — 周期报告任务 | 最近报告周期内降级比例（0–100） |
+| `mev_pool_queue_depth` | Gauge | — | `worker/mod.rs` — `dispatch()` 调用时 | 当前 Worker 任务队列深度 |
+| `mev_pool_queue_full_total` | Counter | — | `worker/mod.rs` — `try_send` 失败时 | 队列已满被丢弃的任务数 |
+| `mev_worker_tasks_total` | Counter | `worker_id` | `worker/worker.rs` — 每次 `handle_task` 完成后 | 各 Worker 线程已完成任务数 |
+| `mev_worker_epoch_switches_total` | Counter | — | `worker/worker.rs` — `switch_epoch()` 内 | Worker epoch 切换次数（等于新块数 × worker 数） |
+| `mev_worker_l1_hits_total` | Counter | `kind` | `provider.rs` — L1 缓存命中路径 | L1 缓存命中数；`kind`=`account`/`storage` |
+| `mev_worker_l1_misses_total` | Counter | `kind` | `provider.rs` — L1 缓存未命中路径 | L1 缓存未命中数；`kind`=`account`/`storage` |
+
+`method` label 取值：`eth_call` / `debug_traceCall` / `trace_call`
+
+##### B. 周期性 tracing log（`reth::mev::stats`）
+
+每隔 `MEV_STATS_INTERVAL_SECS`（默认 30 秒）由 `metrics.rs` 中的后台任务输出一条结构化日志，包含所有三个方法的累计量与增量。
+
+| 字段名 | 含义 |
+|---|---|
+| `eth_call_total` | eth_call 累计请求数 |
+| `eth_call_delta` | 本周期新增请求数 |
+| `eth_call_worker` | 本周期进入 Worker 路径数 |
+| `eth_call_degraded` | 本周期降级数 |
+| `eth_call_degraded_pct` | 本周期降级比例（整数 %） |
+| `eth_call_errors` | 本周期 Worker 错误数 |
+| `debug_trace_*` / `trace_call_*` | 同上，对应其他两个方法 |
+
+##### C. 指标与代码位置对照
+
+```
+crates/mev/src/
+├── metrics.rs                   ← MevCounters / record_*() / spawn_periodic_reporter()
+│                                  指标: mev_requests_total, mev_worker_path_total,
+│                                        mev_degraded_path_total, mev_errors_total,
+│                                        mev_e2e_duration_seconds, mev_degraded_pct
+│
+├── api/server.rs                ← 埋点调用：每个 mev_* 方法的入口/路由决策/出口
+│                                  调用: record_request / record_worker_path /
+│                                        record_degraded_path / record_error /
+│                                        record_e2e_latency
+│
+├── worker/mod.rs                ← MevWorkerPool::dispatch()
+│                                  指标: mev_pool_queue_depth, mev_pool_queue_full_total
+│
+├── worker/worker.rs             ← MevWorker::run() / switch_epoch()
+│                                  指标: mev_worker_tasks_total, mev_worker_epoch_switches_total
+│
+└── provider.rs                  ← WorkerStateProvider::basic() / storage()
+                                   指标: mev_worker_l1_hits_total, mev_worker_l1_misses_total
+```
+
+##### D. 关键派生指标（Prometheus 查询示例）
+
+```promql
+# L1 缓存命中率（account + storage 合计）
+sum(rate(mev_worker_l1_hits_total[1m]))
+  / (sum(rate(mev_worker_l1_hits_total[1m])) + sum(rate(mev_worker_l1_misses_total[1m])))
+
+# eth_call 降级率（最近 5 分钟）
+rate(mev_degraded_path_total{method="eth_call"}[5m])
+  / rate(mev_requests_total{method="eth_call"}[5m])
+
+# Worker 平均吞吐量（tasks/s）
+sum(rate(mev_worker_tasks_total[1m]))
+
+# 队列深度趋势
+mev_pool_queue_depth
+
+# P99 端到端延迟
+histogram_quantile(0.99, rate(mev_e2e_duration_seconds_bucket{method="eth_call"}[5m]))
+```
+
+#### 17.10.5 编译验证
+
+```
+cargo check -p reth-mev
+→ Checking reth-mev v1.11.3
+→ Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.85s
+→ warning count: 0
+→ error count:   0
+```
+
+#### 17.10.6 日志位置与查询命令
+
+##### 日志位置
+
+Reth 日志位置取决于启动方式：
+
+| 启动方式 | 日志位置 |
+|---|---|
+| systemd（未配置 `--log.file.directory`） | journald，用 `journalctl -u reth` 查看 |
+| 配置了 `--log.file.directory /dt-logs/log/mainnet` | `/dt-logs/log/mainnet/reth.log` |
+
+**建议在 systemd service 中补充文件日志参数**：
+
+```ini
+ExecStart=/usr/local/bin/reth node \
+  ... \
+  --log.file.directory /dt-logs/log/mainnet \
+  --log.file.format json \
+  --log.file.max-size 200 \
+  --log.file.max-files 10
+```
+
+修改后执行 `sudo systemctl daemon-reload && sudo systemctl restart reth` 生效。
+
+---
+
+##### 从文件查询（JSON 格式日志）
+
+**实时监控——所有指标格式化输出**：
+
+```bash
+tail -f /dt-logs/log/mainnet/reth.log \
+  | grep --line-buffered '"target":"reth::mev::stats"' \
+  | jq -r '
+      .timestamp as $t |
+      .fields |
+      "[\($t)]  ── mev periodic stats ──────────────────────────────
+  eth_call       total=\(.eth_call_total)  delta=\(.eth_call_delta)  worker=\(.eth_call_worker)  degraded=\(.eth_call_degraded)  degraded_pct=\(.eth_call_degraded_pct)%  errors=\(.eth_call_errors)
+  debug_trace    total=\(.debug_trace_total)  delta=\(.debug_trace_delta)  worker=\(.debug_trace_worker)  degraded=\(.debug_trace_degraded)  degraded_pct=\(.debug_trace_degraded_pct)%  errors=\(.debug_trace_errors)
+  trace_call     total=\(.trace_call_total)  delta=\(.trace_call_delta)  worker=\(.trace_call_worker)  degraded=\(.trace_call_degraded)  degraded_pct=\(.trace_call_degraded_pct)%  errors=\(.trace_call_errors)"
+    '
+```
+
+**历史日志——紧凑单行，便于扫描趋势**：
+
+```bash
+grep '"target":"reth::mev::stats"' /dt-logs/log/mainnet/reth.log \
+  | jq -r '
+      .timestamp as $t |
+      .fields |
+      "[\($t)]  eth_call delta=\(.eth_call_delta) worker=\(.eth_call_worker) degraded=\(.eth_call_degraded)(\(.eth_call_degraded_pct)%) | debug delta=\(.debug_trace_delta) degraded=\(.debug_trace_degraded)(\(.debug_trace_degraded_pct)%) | trace delta=\(.trace_call_delta) degraded=\(.trace_call_degraded)(\(.trace_call_degraded_pct)%)"
+    '
+```
+
+**历史日志——统计指定时间段内累计降级次数**：
+
+```bash
+grep '"target":"reth::mev::stats"' /dt-logs/log/mainnet/reth.log \
+  | jq -s '
+      map(.fields) |
+      {
+        eth_call_total_requests:    (map(.eth_call_delta)          | add),
+        eth_call_total_degraded:    (map(.eth_call_degraded)       | add),
+        debug_trace_total_degraded: (map(.debug_trace_degraded)    | add),
+        trace_call_total_degraded:  (map(.trace_call_degraded)     | add)
+      } |
+      .eth_call_degraded_pct = (
+        if .eth_call_total_requests > 0
+        then (.eth_call_total_degraded * 100 / .eth_call_total_requests | floor)
+        else 0 end
+      )
+    '
+```
+
+**实时告警——降级率超过 10% 时打印警告**：
+
+```bash
+tail -f /dt-logs/log/mainnet/reth.log \
+  | grep --line-buffered '"target":"reth::mev::stats"' \
+  | jq --unbuffered -r '
+      .fields |
+      if .eth_call_degraded_pct > 10 then
+        "⚠️  ALERT eth_call degraded_pct=\(.eth_call_degraded_pct)%  delta=\(.eth_call_delta)  degraded=\(.eth_call_degraded)"
+      else
+        "✓  eth_call degraded_pct=\(.eth_call_degraded_pct)%  (\(.eth_call_worker)/\(.eth_call_delta) via worker)"
+      end'
+```
+
+---
+
+##### 从 journalctl 查询（systemd 默认无日志文件时）
+
+**实时监控——所有指标格式化输出**：
+
+```bash
+sudo journalctl -u reth -f \
+  | grep --line-buffered "mev periodic stats" \
+  | grep -oP '(?<=reth::mev::stats\s{2}).*' \
+  | awk '{print strftime("[%Y-%m-%dT%H:%M:%SZ]"), $0}'
+```
+
+**提取降级率数字（纯文本格式日志）**：
+
+```bash
+sudo journalctl -u reth --since "1 hour ago" \
+  | grep "mev periodic stats" \
+  | grep -oP 'eth_call_degraded_pct=\K[0-9]+'
+```
+
+**计算最近 20 个周期平均降级率**：
+
+```bash
+sudo journalctl -u reth --since "1 hour ago" \
+  | grep "mev periodic stats" \
+  | tail -20 \
+  | grep -oP 'eth_call_degraded_pct=\K[0-9]+' \
+  | awk '{sum+=$1; n++} END {printf "avg eth_call degraded_pct=%.1f%% over %d periods\n", sum/n, n}'
+```
+
+**查看最近一次报告完整内容**：
+
+```bash
+sudo journalctl -u reth -n 500 | grep "mev periodic stats" | tail -1
+```
+
+---
+
+##### 建议设置 RUST_LOG 过滤
+
+在 systemd service 的 `[Service]` 段加入：
+
+```ini
+Environment=RUST_LOG=info,reth::mev::stats=info
+```
+
+确保 mev stats 日志在任何全局日志级别下都可见。

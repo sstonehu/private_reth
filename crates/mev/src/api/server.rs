@@ -1,6 +1,7 @@
 use crate::{
     api::types::CallKind,
     epoch::{EpochContext, EpochManager},
+    metrics::{self, method, MevCounters},
     worker::{MevWorkerPool, WorkerError, WorkerOutput, WorkerTask},
 };
 use alloy_network::TransactionBuilder;
@@ -19,7 +20,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::api::FromRevert, EthApiError};
 use reth_rpc_server_types::result::internal_rpc_err;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 /// 节点级配置，由 `install_mev_rpc` 读取构造。
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +33,7 @@ pub struct MevApiServer<EthApi: RpcNodeCore<Evm = reth_evm_ethereum::EthEvmConfi
     pub epoch_manager: Arc<EpochManager>,
     pub worker_pool: Arc<MevWorkerPool>,
     pub call_config: MevCallConfig,
+    pub counters: Arc<MevCounters>,
     pub eth_api: EthApi,
     pub debug_api: reth_rpc::DebugApi<EthApi>,
     pub trace_api: reth_rpc::TraceApi<EthApi>,
@@ -45,6 +47,7 @@ impl<EthApi: RpcNodeCore<Evm = reth_evm_ethereum::EthEvmConfig>> std::fmt::Debug
             .field("epoch_manager", &self.epoch_manager)
             .field("worker_pool", &self.worker_pool)
             .field("call_config", &self.call_config)
+            .field("counters", &self.counters)
             .finish_non_exhaustive()
     }
 }
@@ -104,12 +107,21 @@ where
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes> {
+        let t0 = Instant::now();
+        let c = &self.counters.eth_call;
+        metrics::record_request(method::ETH_CALL, c);
+
         if !self.epoch_manager.matches_active(block_id) {
+            metrics::record_degraded_path(method::ETH_CALL, c);
             let overrides =
                 alloy_rpc_types_eth::state::EvmOverrides::new(state_overrides, block_overrides);
-            return self.eth_api.call(request, block_id, overrides).await.map_err(Into::into);
+            let result =
+                self.eth_api.call(request, block_id, overrides).await.map_err(Into::into);
+            metrics::record_e2e_latency(method::ETH_CALL, t0.elapsed());
+            return result;
         }
 
+        metrics::record_worker_path(method::ETH_CALL, c);
         let epoch = self.epoch_manager.current();
         let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
@@ -128,13 +140,21 @@ where
 
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
 
-        match result_rx.await {
+        let result = match result_rx.await {
             Ok(Ok(WorkerOutput::Basic(bytes))) => Ok(bytes),
             Ok(Err(WorkerError::Revert(data))) => Err(EthApiError::from_revert(data).into()),
-            Ok(Err(err)) => Err(internal_rpc_err(err.to_string())),
-            Err(_) => Err(internal_rpc_err("worker dropped")),
+            Ok(Err(err)) => {
+                metrics::record_error(method::ETH_CALL, "worker_error", c);
+                Err(internal_rpc_err(err.to_string()))
+            }
+            Err(_) => {
+                metrics::record_error(method::ETH_CALL, "worker_dropped", c);
+                Err(internal_rpc_err("worker dropped"))
+            }
             _ => Err(internal_rpc_err("unexpected worker output")),
-        }
+        };
+        metrics::record_e2e_latency(method::ETH_CALL, t0.elapsed());
+        result
     }
 
     async fn mev_debug_trace_call(
@@ -143,16 +163,24 @@ where
         block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<GethTrace> {
+        let t0 = Instant::now();
+        let c = &self.counters.debug_trace_call;
+        metrics::record_request(method::DEBUG_TRACE, c);
+
         if !self.epoch_manager.matches_active(block_id) {
-            return DebugApiServer::debug_trace_call(
+            metrics::record_degraded_path(method::DEBUG_TRACE, c);
+            let result = DebugApiServer::debug_trace_call(
                 &self.debug_api,
                 request,
                 block_id,
                 Some(opts.unwrap_or_default()),
             )
             .await;
+            metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
+            return result;
         }
 
+        metrics::record_worker_path(method::DEBUG_TRACE, c);
         let opts = opts.unwrap_or_default();
         let state_overrides = opts.state_overrides.clone();
         let block_overrides = opts.block_overrides.clone().map(Box::new);
@@ -175,12 +203,20 @@ where
 
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
 
-        match result_rx.await {
+        let result = match result_rx.await {
             Ok(Ok(WorkerOutput::DebugTrace(trace))) => Ok(trace),
-            Ok(Err(err)) => Err(internal_rpc_err(err.to_string())),
-            Err(_) => Err(internal_rpc_err("worker dropped")),
+            Ok(Err(err)) => {
+                metrics::record_error(method::DEBUG_TRACE, "worker_error", c);
+                Err(internal_rpc_err(err.to_string()))
+            }
+            Err(_) => {
+                metrics::record_error(method::DEBUG_TRACE, "worker_dropped", c);
+                Err(internal_rpc_err("worker dropped"))
+            }
             _ => Err(internal_rpc_err("unexpected worker output")),
-        }
+        };
+        metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
+        result
     }
 
     async fn mev_trace_call(
@@ -191,10 +227,15 @@ where
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<TraceResults> {
+        let t0 = Instant::now();
+        let c = &self.counters.trace_call;
+        metrics::record_request(method::TRACE_CALL, c);
+
         let trace_types: HashSet<_> = trace_types.into_iter().collect();
 
         if !self.epoch_manager.matches_active(block_id) {
-            return TraceApiServer::trace_call(
+            metrics::record_degraded_path(method::TRACE_CALL, c);
+            let result = TraceApiServer::trace_call(
                 &self.trace_api,
                 request,
                 trace_types,
@@ -203,8 +244,11 @@ where
                 block_overrides,
             )
             .await;
+            metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
+            return result;
         }
 
+        metrics::record_worker_path(method::TRACE_CALL, c);
         let epoch = self.epoch_manager.current();
         let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
@@ -223,11 +267,19 @@ where
 
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
 
-        match result_rx.await {
+        let result = match result_rx.await {
             Ok(Ok(WorkerOutput::ParityTrace(trace))) => Ok(trace),
-            Ok(Err(err)) => Err(internal_rpc_err(err.to_string())),
-            Err(_) => Err(internal_rpc_err("worker dropped")),
+            Ok(Err(err)) => {
+                metrics::record_error(method::TRACE_CALL, "worker_error", c);
+                Err(internal_rpc_err(err.to_string()))
+            }
+            Err(_) => {
+                metrics::record_error(method::TRACE_CALL, "worker_dropped", c);
+                Err(internal_rpc_err("worker dropped"))
+            }
             _ => Err(internal_rpc_err("unexpected worker output")),
-        }
+        };
+        metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
+        result
     }
 }

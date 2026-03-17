@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod epoch;
+pub mod metrics;
 pub mod provider;
 pub mod worker;
 
@@ -18,6 +19,7 @@ use crate::{
         MevApiServer as _,
     },
     epoch::EpochManager,
+    metrics::MevCounters,
     worker::{MevWorkerPool, DEFAULT_POOL_SIZE},
 };
 use reth_node_api::{BlockTy, FullNodeComponents, HeaderTy, NodeTypes, ReceiptTy, TxTy};
@@ -89,15 +91,35 @@ where
         .unwrap_or(DEFAULT_POOL_SIZE);
     let worker_pool = MevWorkerPool::new(num_workers, evm_config);
 
-    let mev_module =
-        MevServer { epoch_manager, worker_pool, call_config, eth_api, debug_api, trace_api }
-            .into_rpc();
+    // Shared counters: passed into server for per-request recording and into the
+    // periodic reporter for delta-based log summaries.
+    let counters = MevCounters::new();
+    let stats_interval_secs = std::env::var("MEV_STATS_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    metrics::spawn_periodic_reporter(
+        counters.clone(),
+        std::time::Duration::from_secs(stats_interval_secs),
+    );
+
+    let mev_module = MevServer {
+        epoch_manager,
+        worker_pool,
+        call_config,
+        counters,
+        eth_api,
+        debug_api,
+        trace_api,
+    }
+    .into_rpc();
     ctx.modules.merge_configured(mev_module)?;
 
     tracing::info!(
         target: "reth::mev",
         num_workers,
         call_gas_cap = call_config.call_gas_cap,
+        stats_interval_secs,
         "mev RPC module installed (mev_eth_call / mev_debug_traceCall / mev_trace_call)"
     );
 

@@ -14,7 +14,7 @@ pub use worker::MevWorker;
 /// 默认 worker 数量，针对 64 线程服务器（EPYC 9554P）：
 /// 保留 16 给 tokio + 4 给 MDBX = 20 非 EVM 线程，剩余 40 用于 EVM 执行。
 /// 可通过环境变量 MEV_WORKER_COUNT 覆盖。
-pub const DEFAULT_POOL_SIZE: usize = 40;
+pub const DEFAULT_POOL_SIZE: usize = 512;
 
 /// 工作队列容量（有界 channel 背压上限）。
 /// 目标场景：新 block 后 1s 内 ~50,000 请求集中到达。

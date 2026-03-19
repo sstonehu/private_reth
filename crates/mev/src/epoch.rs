@@ -4,7 +4,9 @@ use alloy_primitives::{BlockHash, BlockNumber, B256};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::ChainInfo;
 use reth_evm::ConfigureEvm;
-use reth_storage_api::{BlockHashReader, BlockIdReader, BlockNumReader, StateProviderFactory};
+use reth_storage_api::{
+    BlockHashReader, BlockIdReader, BlockNumReader, HeaderProvider, StateProviderFactory,
+};
 use revm::primitives::hardfork::SpecId;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -154,6 +156,7 @@ impl StateProviderFactory for PlaceholderProviderFactory {
 pub struct EpochManager {
     active_tx: watch::Sender<Arc<EpochContext>>,
     pub active_rx: watch::Receiver<Arc<EpochContext>>,
+    debug_fixed_block: Option<BlockNumber>,
 }
 
 impl std::fmt::Debug for EpochManager {
@@ -161,28 +164,97 @@ impl std::fmt::Debug for EpochManager {
         f.debug_struct("EpochManager")
             .field("current_epoch_id", &self.active_rx.borrow().epoch_id)
             .field("current_block_number", &self.active_rx.borrow().block_number)
+            .field("debug_fixed_block", &self.debug_fixed_block)
             .finish_non_exhaustive()
     }
 }
 
 impl EpochManager {
-    /// 启动后台任务：监听 canonical state，维护 active epoch。
-    pub fn spawn<P>(provider: P, evm_config: reth_evm_ethereum::EthEvmConfig) -> Arc<Self>
+    fn build_fixed_epoch<P>(
+        provider: &P,
+        evm_config: &reth_evm_ethereum::EthEvmConfig,
+        block_num: BlockNumber,
+    ) -> eyre::Result<EpochContext>
     where
-        P: CanonStateSubscriptions<Primitives = reth_ethereum_primitives::EthPrimitives>
+        P: HeaderProvider<Header = alloy_consensus::Header>
+            + BlockHashReader
             + StateProviderFactory
             + Clone
             + Send
             + Sync
             + 'static,
     {
+        let header =
+            provider.header_by_number(block_num)?.ok_or_else(|| eyre::eyre!("block {} not found", block_num))?;
+
+        let block_hash = provider
+            .block_hash(block_num)?
+            .ok_or_else(|| eyre::eyre!("block hash not found for block {}", block_num))?;
+
+        let block_env = evm_config
+            .evm_env(&header)
+            .map_err(|err| eyre::eyre!("failed to build evm_env: {:?}", err))?;
+        let spec_id = *block_env.spec_id();
+
+        Ok(EpochContext {
+            epoch_id: 1,
+            block_number: block_num,
+            block_hash,
+            block_env,
+            spec_id,
+            state_provider_factory: Arc::new((*provider).clone()),
+        })
+    }
+
+    /// 启动后台任务：监听 canonical state，维护 active epoch。
+    pub fn spawn<P>(provider: P, evm_config: reth_evm_ethereum::EthEvmConfig) -> Arc<Self>
+    where
+        P: CanonStateSubscriptions<Primitives = reth_ethereum_primitives::EthPrimitives>
+            + HeaderProvider<Header = alloy_consensus::Header>
+            + StateProviderFactory
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let debug_fixed_block = std::env::var("MEV_DEBUG_FIXED_EPOCH")
+            .ok()
+            .and_then(|value| value.parse::<BlockNumber>().ok());
+
         let initial = Arc::new(EpochContext::placeholder());
         let (active_tx, active_rx) = watch::channel(initial);
 
-        let manager = Arc::new(Self { active_tx, active_rx });
+        let manager = Arc::new(Self { active_tx, active_rx, debug_fixed_block });
         let manager_clone = Arc::clone(&manager);
+        let fixed_block = debug_fixed_block;
 
         tokio::spawn(async move {
+            if let Some(block_num) = fixed_block {
+                // Fixed epoch debug mode: load once, never update.
+                match Self::build_fixed_epoch(&provider, &evm_config, block_num) {
+                    Ok(epoch) => {
+                        let _ = manager_clone.active_tx.send(Arc::new(epoch));
+                        tracing::warn!(
+                            target: "reth::mev::epoch",
+                            block_number = block_num,
+                            "MEV_DEBUG_FIXED_EPOCH is set: epoch frozen at block {}. \
+                             All mev_* requests will use this block's state. NOT for production use.",
+                            block_num
+                        );
+                        std::future::pending::<()>().await;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            target: "reth::mev::epoch",
+                            ?err,
+                            block_number = block_num,
+                            "failed to build fixed epoch, falling back to normal mode"
+                        );
+                    }
+                }
+            }
+
+            // Normal mode: subscribe to canonical state notifications.
             let mut notifications = provider.subscribe_to_canonical_state();
             let mut epoch_counter = 0_u64;
 
@@ -245,6 +317,11 @@ impl EpochManager {
 
     /// 判断请求 block_id 是否与 active epoch 匹配。
     pub fn matches_active(&self, block_id: Option<BlockId>) -> bool {
+        // In fixed epoch debug mode, all requests go through the worker path.
+        if self.debug_fixed_block.is_some() {
+            return true;
+        }
+
         match block_id {
             None => true,
             Some(BlockId::Number(num)) => match num {

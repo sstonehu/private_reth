@@ -699,11 +699,56 @@ rate(mev_global_cache_db_reads_total[5m])
 
 ## 14. 可配置环境变量
 
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `MEV_GLOBAL_CACHE_MAX_MB` | `16384` | GlobalSharedCache 总内存上限（MB） |
-| `MEV_WORKER_COUNT` | `DEFAULT_POOL_SIZE`（40） | Worker 线程数（Phase 1 已有）|
-| `MEV_STATS_INTERVAL_SECS` | `30` | 周期 log 间隔（Phase 1 已有）|
+所有配置项均通过环境变量注入，在进程启动前设置，**无需重新编译**。
+
+### 14.1 环境变量汇总
+
+| 环境变量 | 类型 | 默认值 | 说明 | 生效位置 |
+|---|---|---|---|---|
+| `MEV_WORKER_COUNT` | `usize` | `40` | Worker OS 线程数（EVM 并行度）。建议 = 总核数 − 20（留给 tokio + MDBX） | `lib.rs` |
+| `MEV_GLOBAL_CACHE_MAX_MB` | `u64` | `16384`（16 GB） | GlobalSharedCache 总内存上限（MB），按 §14.2 比例分配给三个子缓存 | `lib.rs` |
+| `MEV_STATS_INTERVAL_SECS` | `u64` | `30` | 周期性 tracing 统计日志输出间隔（秒） | `lib.rs` |
+
+### 14.2 GlobalSharedCache 内存分配比例
+
+`MEV_GLOBAL_CACHE_MAX_MB` 的总预算按固定比例分配给三个子缓存（代码位于 `cache/mod.rs::GlobalSharedCache::new`）：
+
+| 子缓存 | 比例 | 默认值（16 GB） | 键类型 | 估算权重/条 |
+|---|---|---|---|---|
+| `storage` | **70%** | ≈ 11.5 GB | `(epoch_id, address, slot)` | 96 bytes |
+| `accounts` | **25%** | ≈ 4 GB | `(epoch_id, address)` | 128 bytes |
+| `bytecodes` | **5%** | ≈ 800 MB | `code_hash` | `32 + bytecode.len()` |
+
+### 14.3 硬编码常量（当前不可配置）
+
+以下常量目前硬编码在代码中，如有需要可在后续版本通过环境变量暴露：
+
+| 常量 | 位置 | 当前值 | 说明 |
+|---|---|---|---|
+| `TASK_QUEUE_CAPACITY` | `worker/mod.rs` | `65536` | Worker 有界队列容量（背压上限）。65536 × ~512B/task ≈ 32MB，容纳新块后 ~50,000 请求集中到达 |
+
+### 14.4 systemd 配置示例
+
+```ini
+[Service]
+# EVM worker 线程数，根据服务器核数调整
+Environment="MEV_WORKER_COUNT=40"
+# GlobalSharedCache 内存上限，16GB
+Environment="MEV_GLOBAL_CACHE_MAX_MB=16384"
+# 统计日志每 60 秒输出一次
+Environment="MEV_STATS_INTERVAL_SECS=60"
+ExecStart=/usr/local/bin/reth node \
+  --http \
+  --http.api eth,net,web3,debug,trace,mev \
+  ...
+```
+
+启动后日志中会出现以下确认行：
+
+```
+INFO reth::mev  num_workers=40 cache_max_mb=16384 call_gas_cap=... stats_interval_secs=60
+     mev RPC module installed (Phase 2: GlobalSharedCache enabled)
+```
 
 ---
 
@@ -1510,3 +1555,322 @@ cargo nextest run -p reth-mev
 ### 22.4 本轮范围说明
 
 - 本轮测试任务仅在目标文件中新增测试模块，未在本轮引入额外非测试逻辑改动。
+
+---
+
+## 23. 固定 Epoch 调试模式（`MEV_DEBUG_FIXED_EPOCH`）
+
+### 23.1 背景与问题
+
+`mev_*` 接口的 Worker 快速路径（非降级）只在请求的 `block_id` 与当前活跃 Epoch（最新 canonical block）匹配时触发。历史 block 请求必然降级到 `eth_api/debug_api`，导致：
+
+- 无法用已归档的 block 做回放压测
+- 无法稳定复现 Worker 路径行为（最新 block 每 12 秒变化一次）
+- 性能基准测试结果受链进度干扰
+
+### 23.2 方案：`MEV_DEBUG_FIXED_EPOCH` 环境变量
+
+启动时设置该变量，`EpochManager` 将立即加载指定 block 的状态作为 Epoch，并永久冻结，不再跟随链进度更新。`matches_active()` 在此模式下对任意 `block_id` 返回 `true`，所有 `mev_*` 请求强制走 Worker 路径。
+
+```
+MEV_DEBUG_FIXED_EPOCH=21000000 reth node --http --http.api eth,debug,trace,mev ...
+```
+
+**注意**：此模式仅用于测试/基准环境。节点仍正常同步，但 MEV 服务的状态固定在指定 block，不反映链上最新状态。
+
+### 23.3 行为对比
+
+| 特性 | 正常模式 | 固定 Epoch 模式 |
+|---|---|---|
+| Epoch 更新 | 每个新 canonical block 触发 | 启动时加载一次，永不更新 |
+| `matches_active(任意 block_id)` | 仅匹配最新 block | 始终返回 `true` |
+| Worker 路径命中 | 仅 latest block 请求 | 所有请求 |
+| 节点同步 | 正常 | 正常（Epoch 与同步完全解耦）|
+| MEV 服务状态 | 实时最新 | 固定在 `MEV_DEBUG_FIXED_EPOCH` 指定的 block |
+
+### 23.4 改动范围
+
+**仅改动一个文件**：`crates/mev/src/epoch.rs`，无其余文件改动。
+
+```
+crates/mev/src/epoch.rs
+  EpochManager struct
+    └── 新增字段：debug_fixed_block: Option<BlockNumber>
+
+  EpochManager::spawn<P>(...)
+    └── 新增 trait bound：P: reth_storage_api::HeaderProvider<Header = alloy_consensus::Header>
+    └── 启动前读取 MEV_DEBUG_FIXED_EPOCH
+    └── 若设置：调用 build_fixed_epoch() 构造初始 EpochContext，发送后让后台任务永久 pending
+    └── 若未设置：原有 canonical 订阅逻辑不变
+
+  EpochManager::matches_active(&self, block_id)
+    └── debug_fixed_block.is_some() 时直接 return true
+
+  新增私有函数：build_fixed_epoch<P>(provider, evm_config, block_num)
+    └── provider.header_by_number(block_num) → Header
+    └── provider.block_hash(block_num) → B256
+    └── evm_config.evm_env(&header) → EthEvmEnv
+    └── 构造并返回 EpochContext { epoch_id: 1, block_number, block_hash, block_env, ... }
+```
+
+### 23.5 数据流
+
+```
+启动时（MEV_DEBUG_FIXED_EPOCH=21000000）
+  ├── read "MEV_DEBUG_FIXED_EPOCH" → 21000000
+  ├── provider.header_by_number(21000000) → Header { number, timestamp, ... }
+  ├── provider.block_hash(21000000)       → B256 hash
+  ├── evm_config.evm_env(&header)        → EthEvmEnv
+  ├── EpochContext { epoch_id=1, block_number=21000000, block_hash, block_env, ... }
+  └── active_tx.send(epoch) → workers 在首个任务到来时 switch_epoch(block 21000000)
+
+请求到达（任意 block_id）
+  ├── epoch_manager.matches_active(block_id) → true（固定模式）
+  ├── epoch_manager.current() → EpochContext(block 21000000)
+  └── dispatch 到 Worker → 使用 block 21000000 的状态执行 EVM
+```
+
+### 23.6 关键实现约束
+
+1. **`HeaderProvider` trait bound**：`build_fixed_epoch` 需要 `provider.header_by_number(n)` 和 `provider.block_hash(n)`。`block_hash` 已通过 `StateProviderFactory: BlockHashReader` 可用；`header_by_number` 需在 `spawn()` 的 `P` 上新增 `reth_storage_api::HeaderProvider<Header = alloy_consensus::Header>` bound。
+
+2. **`lib.rs` 侧无需改动**：`ctx.registry.provider()` 实现了 `FullRpcProvider`，满足所有新增 bound。
+
+3. **后台任务处理**：固定模式下后台 tokio task 发送初始 epoch 后调用 `std::future::pending::<()>().await`，不再监听 canonical 通知，不消耗 CPU。
+
+4. **`worker.rs` 无需改动**：`switch_epoch()` 调用 `epoch.state_provider_factory.state_by_block_hash(epoch.block_hash)`，`epoch.block_hash` 是真实的历史 block hash，Provider 可正确服务该请求。
+
+5. **`server.rs` 无需改动**：`matches_active()` 的返回值变化已足够让请求走 Worker 路径。
+
+### 23.7 启动日志
+
+固定模式下应输出醒目的 WARNING 级别日志，防止误用：
+
+```
+WARN reth::mev::epoch  block_number=21000000
+     MEV_DEBUG_FIXED_EPOCH is set: epoch frozen at block 21000000.
+     All mev_* requests will use this block's state. NOT for production use.
+```
+
+### 23.8 典型测试流程
+
+```bash
+# 1. 以固定 epoch 启动 reth
+MEV_DEBUG_FIXED_EPOCH=21000000 \
+MEV_WORKER_COUNT=40 \
+reth node --http --http.api eth,net,debug,trace,mev ...
+
+# 2. 确认 epoch 已加载（查看日志）
+journalctl -u reth -n 20 | grep "mev::epoch"
+
+# 3. 发送历史 block 请求，确认走 Worker 路径（worker_path 计数应上升）
+curl -s http://localhost:8545 -d '{
+  "jsonrpc":"2.0","method":"mev_debug_traceCall",
+  "params":[{"to":"0x...","data":"0x..."},null,"0x1400000",null],"id":1}'
+
+# 4. 批量压测
+for i in $(seq 1 10000); do
+  curl -s http://localhost:8545 -d '{...mev_debug_traceCall...}' &
+done
+wait
+
+# 5. 查看统计（worker_path 应 = 请求总数，degraded = 0）
+journalctl -u reth | grep "mev_periodic_stats" | tail -5
+```
+
+---
+
+## 附录 C：固定 Epoch 模式 Codex 实现 Prompt
+
+````
+You are implementing MEV_DEBUG_FIXED_EPOCH support in the Reth MEV crate.
+Target file: crates/mev/src/epoch.rs
+No other files need to be changed.
+
+## Context
+
+EpochManager currently:
+- Subscribes to canonical state notifications
+- Updates `active_epoch` on each new tip block
+- `matches_active(block_id)` returns true only when block_id matches the latest tip
+
+The goal: when env var `MEV_DEBUG_FIXED_EPOCH=N` is set at startup, freeze the epoch at
+block N and make `matches_active()` always return true, so all `mev_*` requests go through
+the Worker path regardless of the block_id they specify.
+
+## Current EpochManager::spawn signature
+
+```rust
+pub fn spawn<P>(provider: P, evm_config: reth_evm_ethereum::EthEvmConfig) -> Arc<Self>
+where
+    P: CanonStateSubscriptions<Primitives = reth_ethereum_primitives::EthPrimitives>
+        + StateProviderFactory
+        + Clone + Send + Sync + 'static,
+```
+
+## Required changes (epoch.rs ONLY)
+
+### 1. Add `debug_fixed_block: Option<BlockNumber>` field to EpochManager
+
+```rust
+pub struct EpochManager {
+    active_tx: watch::Sender<Arc<EpochContext>>,
+    pub active_rx: watch::Receiver<Arc<EpochContext>>,
+    debug_fixed_block: Option<BlockNumber>,  // NEW
+}
+```
+
+### 2. Add new trait bound to spawn<P>()
+
+Add to the where clause:
+```rust
++ reth_storage_api::HeaderProvider<Header = alloy_consensus::Header>
+```
+
+### 3. Read env var and store in struct
+
+At the top of `spawn()`:
+```rust
+let debug_fixed_block = std::env::var("MEV_DEBUG_FIXED_EPOCH")
+    .ok()
+    .and_then(|v| v.parse::<BlockNumber>().ok());
+```
+
+Pass `debug_fixed_block` when constructing `Arc::new(Self { active_tx, active_rx, debug_fixed_block })`.
+
+### 4. Add private function `build_fixed_epoch`
+
+```rust
+fn build_fixed_epoch<P>(
+    provider: &P,
+    evm_config: &reth_evm_ethereum::EthEvmConfig,
+    block_num: BlockNumber,
+) -> eyre::Result<EpochContext>
+where
+    P: reth_storage_api::HeaderProvider<Header = alloy_consensus::Header>
+        + reth_storage_api::BlockHashReader
+        + reth_storage_api::StateProviderFactory,
+{
+    use reth_storage_api::{BlockHashReader, HeaderProvider};
+    use reth_evm::ConfigureEvm;
+
+    let header = provider
+        .header_by_number(block_num)?
+        .ok_or_else(|| eyre::eyre!("block {} not found", block_num))?;
+
+    let block_hash = provider
+        .block_hash(block_num)?
+        .ok_or_else(|| eyre::eyre!("block hash not found for block {}", block_num))?;
+
+    let block_env = evm_config
+        .evm_env(&header)
+        .map_err(|e| eyre::eyre!("failed to build evm_env: {:?}", e))?;
+
+    let spec_id = *block_env.spec_id();
+
+    Ok(EpochContext {
+        epoch_id: 1,
+        block_number: block_num,
+        block_hash,
+        block_env,
+        spec_id,
+        state_provider_factory: Arc::new(provider.clone()),
+    })
+}
+```
+
+### 5. Modify the tokio::spawn closure in spawn()
+
+Replace the existing `tokio::spawn(async move { ... })` body with:
+
+```rust
+tokio::spawn(async move {
+    if let Some(block_num) = fixed_block {
+        // Fixed epoch debug mode: load once, never update
+        match Self::build_fixed_epoch(&provider, &evm_config, block_num) {
+            Ok(epoch) => {
+                let _ = manager_clone.active_tx.send(Arc::new(epoch));
+                tracing::warn!(
+                    target: "reth::mev::epoch",
+                    block_number = block_num,
+                    "MEV_DEBUG_FIXED_EPOCH is set: epoch frozen at block {}. \
+                     All mev_* requests will use this block's state. NOT for production use.",
+                    block_num
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "reth::mev::epoch",
+                    ?err,
+                    block_number = block_num,
+                    "failed to build fixed epoch, falling back to normal mode"
+                );
+                // Fall through to normal subscription mode
+                // (re-run the normal loop below)
+            }
+        }
+        if manager_clone.debug_fixed_block.is_some() {
+            // Successfully frozen: sleep forever, no canonical updates
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // Normal mode: subscribe to canonical state notifications
+    let mut notifications = provider.subscribe_to_canonical_state();
+    let mut epoch_counter = 0_u64;
+
+    loop {
+        // ... existing loop body unchanged ...
+    }
+});
+```
+
+### 6. Modify matches_active()
+
+```rust
+pub fn matches_active(&self, block_id: Option<BlockId>) -> bool {
+    // In fixed epoch debug mode, all requests go through the worker path
+    if self.debug_fixed_block.is_some() {
+        return true;
+    }
+    // Normal production logic (unchanged)
+    match block_id {
+        None => true,
+        Some(BlockId::Number(num)) => match num {
+            BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => true,
+            BlockNumberOrTag::Number(n) => n == self.active_rx.borrow().block_number,
+            _ => false,
+        },
+        Some(BlockId::Hash(hash)) => hash.block_hash == self.active_rx.borrow().block_hash,
+    }
+}
+```
+
+## Imports to add at the top of epoch.rs
+
+Add to the existing use statements:
+```rust
+use reth_primitives_traits::BlockNumber;
+```
+(BlockNumber is u64, may already be in scope via alloy_primitives or reth_primitives)
+
+## Verification after implementation
+
+```bash
+cargo check -p reth-mev
+cargo +nightly clippy -p reth-mev
+```
+
+Both must pass with 0 errors and 0 warnings.
+
+## Important constraints
+
+- Do NOT change any other files (lib.rs, server.rs, worker.rs, etc.)
+- Do NOT add new dependencies to Cargo.toml
+- The `build_fixed_epoch` function must be a private `fn`, not `pub`
+- The `debug_fixed_block` field on `EpochManager` must be `Option<BlockNumber>`, not `Option<u64>` (though they are the same type, use the type alias for clarity)
+- The tracing::warn! message must use WARN level, not INFO, to clearly indicate test mode
+- If `build_fixed_epoch` fails (block not found), fall through to normal subscription mode and log an error
+- `std::future::pending::<()>().await` is the correct way to make the task sleep forever
+- Keep the existing `EpochManager::spawn()` body for the normal path identical to current code
+````

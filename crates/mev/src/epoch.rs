@@ -237,9 +237,8 @@ impl EpochManager {
                         tracing::warn!(
                             target: "reth::mev::epoch",
                             block_number = block_num,
-                            "MEV_DEBUG_FIXED_EPOCH is set: epoch frozen at block {}. \
-                             All mev_* requests will use this block's state. NOT for production use.",
-                            block_num
+                            "MEV_DEBUG_FIXED_EPOCH is set: epoch frozen. \
+                             All mev_* requests will use this block's state. NOT for production use."
                         );
                         std::future::pending::<()>().await;
                     }

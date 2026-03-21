@@ -87,8 +87,6 @@ where
         evm_memory_limit: eth_api.evm_memory_limit(),
     };
 
-    let epoch_manager = EpochManager::spawn(provider, evm_config.clone());
-
     let num_workers = std::env::var("MEV_WORKER_COUNT")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -98,6 +96,11 @@ where
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(16_384);
     let global_cache = GlobalSharedCache::new(cache_max_mb);
+
+    // EpochManager holds a reference to global_cache so it can call
+    // on_epoch_change() each time the canonical head advances.
+    let epoch_manager = EpochManager::spawn(provider, evm_config.clone(), global_cache.clone());
+
     let worker_pool = MevWorkerPool::new(num_workers, evm_config, global_cache.clone());
 
     // Shared counters: passed into server for per-request recording and into the

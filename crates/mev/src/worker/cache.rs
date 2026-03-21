@@ -26,6 +26,8 @@ impl WorkerL1Cache {
     pub fn reset(&mut self, new_epoch_id: u64) {
         self.accounts.clear();
         self.storage.clear();
+        // bytecodes intentionally retained: code_hash → bytecode is immutable,
+        // so cached bytecodes remain valid across epoch boundaries.
         self.epoch_id = new_epoch_id;
     }
 }

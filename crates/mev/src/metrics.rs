@@ -174,6 +174,10 @@ pub fn spawn_periodic_reporter(
             let d_dbg = cur_dbg.delta(&prev_dbg);
             let d_trc = cur_trc.delta(&prev_trc);
 
+            let cache_accounts  = global_cache.account_entry_count();
+            let cache_storage   = global_cache.storage_entry_count();
+            let cache_bytecodes = global_cache.bytecode_entry_count();
+
             tracing::info!(
                 target: "reth::mev::stats",
                 // ── mev_eth_call ──────────────────────────────────────
@@ -197,6 +201,10 @@ pub fn spawn_periodic_reporter(
                 trace_call_degraded     = d_trc.degraded,
                 trace_call_degraded_pct = d_trc.degraded_pct(),
                 trace_call_errors       = d_trc.errors,
+                // ── GlobalSharedCache 条目数（监控内存增长用）──────────
+                cache_accounts,
+                cache_storage,
+                cache_bytecodes,
                 "mev periodic stats"
             );
 

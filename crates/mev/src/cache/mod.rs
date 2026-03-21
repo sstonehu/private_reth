@@ -3,17 +3,35 @@ use moka::sync::Cache;
 use reth_errors::ProviderError;
 use revm::{bytecode::Bytecode, state::AccountInfo};
 use std::sync::Arc;
+use std::time::Duration;
+
+// Weigher functions must include the FULL per-entry memory cost:
+//   key bytes + value bytes + moka internal overhead (hash table slot, deque nodes,
+//   frequency sketch amortized, Arc headers) ≈ 100 bytes per entry.
+// Underestimating the weight causes moka to allow far more entries than intended,
+// growing actual heap well beyond the configured budget.
 
 fn account_weigher(_k: &(u64, Address), _v: &Option<AccountInfo>) -> u32 {
-    128
+    // key: (u64=8, Address=20) = 28 bytes
+    // value: Option<AccountInfo> (nonce:u64, balance:U256, code_hash:B256, code:None) ≈ 80 bytes
+    // moka overhead ≈ 100 bytes
+    // total ≈ 208 → round to 200
+    200
 }
 
 fn storage_weigher(_k: &(u64, Address, U256), _v: &U256) -> u32 {
-    96
+    // key: (u64=8, Address=20, U256=32) = 60 bytes
+    // value: U256 = 32 bytes
+    // moka overhead ≈ 100 bytes
+    // total ≈ 192 → round to 200
+    200
 }
 
 fn bytecode_weigher(_k: &B256, v: &Bytecode) -> u32 {
-    (32 + v.len()).min(u32::MAX as usize) as u32
+    // key: B256 = 32 bytes
+    // value: Bytecode (raw bytes + optional jump table) = v.len() bytes
+    // moka overhead ≈ 100 bytes
+    (32 + v.len() + 100).min(u32::MAX as usize) as u32
 }
 
 /// Cross-worker shared read cache.
@@ -34,14 +52,23 @@ impl GlobalSharedCache {
         let account_budget = total_bytes.saturating_mul(25) / 100;
         let bytecode_budget = total_bytes.saturating_sub(storage_budget + account_budget);
 
+        // Ethereum produces one block every ~12 seconds.  Entries keyed by epoch_id
+        // become unreachable as soon as the epoch advances, so we evict them after
+        // EPOCH_TTI seconds of idleness.  This bounds memory even under sustained
+        // high-insertion bursts where moka's background eviction thread cannot keep
+        // pace with max_capacity alone (observed: 125 M entries vs 60 M limit).
+        const EPOCH_TTI: Duration = Duration::from_secs(30);
+
         Arc::new(Self {
             accounts: Cache::builder()
                 .max_capacity(account_budget)
                 .weigher(account_weigher)
+                .time_to_idle(EPOCH_TTI)
                 .build(),
             storage: Cache::builder()
                 .max_capacity(storage_budget)
                 .weigher(storage_weigher)
+                .time_to_idle(EPOCH_TTI)
                 .build(),
             bytecodes: Cache::builder()
                 .max_capacity(bytecode_budget)
@@ -88,6 +115,21 @@ impl GlobalSharedCache {
 
     pub fn eager_prefetch(&self, _new_epoch_id: u64, _safe_set: &SafeUnchangedSet) {
         // no-op in Phase 2
+    }
+
+    /// Immediately schedule all epoch-keyed entries for eviction.
+    ///
+    /// Called when the canonical head advances to a new block. Entries keyed by
+    /// the old epoch_id will never be accessed again, so there is no reason to
+    /// keep them in memory.  `bytecodes` is intentionally excluded: its key is
+    /// just a B256 code_hash with no epoch component, so bytecodes remain valid
+    /// across epoch boundaries.
+    ///
+    /// `invalidate_all` is O(1) – it schedules eviction; the background
+    /// housekeeper performs the actual removal asynchronously.
+    pub fn on_epoch_change(&self) {
+        self.accounts.invalidate_all();
+        self.storage.invalidate_all();
     }
 
     pub fn account_entry_count(&self) -> u64 {

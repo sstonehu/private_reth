@@ -11,6 +11,8 @@ use revm::primitives::hardfork::SpecId;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::cache::GlobalSharedCache;
+
 type EthEvmEnv = reth_evm::EvmEnvFor<reth_evm_ethereum::EthEvmConfig>;
 
 /// 唯一标识一个区块版本的 epoch 上下文，不可变。
@@ -207,7 +209,15 @@ impl EpochManager {
     }
 
     /// 启动后台任务：监听 canonical state，维护 active epoch。
-    pub fn spawn<P>(provider: P, evm_config: reth_evm_ethereum::EthEvmConfig) -> Arc<Self>
+    ///
+    /// `global_cache` is invalidated on every epoch change so that stale
+    /// epoch-keyed entries (account and storage slots) are evicted promptly
+    /// rather than waiting for TTI expiry.
+    pub fn spawn<P>(
+        provider: P,
+        evm_config: reth_evm_ethereum::EthEvmConfig,
+        global_cache: Arc<GlobalSharedCache>,
+    ) -> Arc<Self>
     where
         P: CanonStateSubscriptions<Primitives = reth_ethereum_primitives::EthPrimitives>
             + HeaderProvider<Header = alloy_consensus::Header>
@@ -291,6 +301,12 @@ impl EpochManager {
                             spec_id,
                             state_provider_factory: Arc::new(provider.clone()),
                         });
+
+                        // Evict all stale epoch-keyed cache entries before
+                        // advertising the new epoch.  Entries from the old
+                        // epoch_id will never be queried again; releasing them
+                        // now prevents unbounded heap growth under burst load.
+                        global_cache.on_epoch_change();
 
                         let _ = manager_clone.active_tx.send(epoch);
                     }

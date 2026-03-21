@@ -10,7 +10,6 @@ use std::sync::Arc;
 pub struct CachedStateProvider<'a> {
     pub l1: &'a mut WorkerL1Cache,
     pub global: Arc<GlobalSharedCache>,
-    pub epoch_id: u64,
     pub db: StateProviderDatabase<&'a StateProviderBox>,
 }
 
@@ -25,7 +24,7 @@ impl Database for CachedStateProvider<'_> {
 
         metrics::counter!("mev_worker_l1_misses_total", "kind" => "account").increment(1);
         let db = &self.db;
-        let info = self.global.get_or_load_account(self.epoch_id, address, || {
+        let info = self.global.get_or_load_account(address, || {
             metrics::counter!("mev_global_cache_db_reads_total", "kind" => "account").increment(1);
             db.basic_ref(address)
         })?;
@@ -57,7 +56,7 @@ impl Database for CachedStateProvider<'_> {
 
         metrics::counter!("mev_worker_l1_misses_total", "kind" => "storage").increment(1);
         let db = &self.db;
-        let value = self.global.get_or_load_storage(self.epoch_id, address, index, || {
+        let value = self.global.get_or_load_storage(address, index, || {
             metrics::counter!("mev_global_cache_db_reads_total", "kind" => "storage").increment(1);
             db.storage_ref(address, index)
         })?;

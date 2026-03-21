@@ -97,8 +97,8 @@ where
         .unwrap_or(16_384);
     let global_cache = GlobalSharedCache::new(cache_max_mb);
 
-    // EpochManager holds a reference to global_cache so it can call
-    // on_epoch_change() each time the canonical head advances.
+    // EpochManager holds a reference to global_cache so it can apply
+    // diff-based cache invalidation (Phase 3) on every canonical head advance.
     let epoch_manager = EpochManager::spawn(provider, evm_config.clone(), global_cache.clone());
 
     let worker_pool = MevWorkerPool::new(num_workers, evm_config, global_cache.clone());

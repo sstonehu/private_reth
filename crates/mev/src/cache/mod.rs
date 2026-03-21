@@ -1,9 +1,9 @@
 use alloy_primitives::{Address, B256, U256};
 use moka::sync::Cache;
+use reth_chain_state::CanonStateNotification;
 use reth_errors::ProviderError;
 use revm::{bytecode::Bytecode, state::AccountInfo};
 use std::sync::Arc;
-use std::time::Duration;
 
 // Weigher functions must include the FULL per-entry memory cost:
 //   key bytes + value bytes + moka internal overhead (hash table slot, deque nodes,
@@ -11,20 +11,20 @@ use std::time::Duration;
 // Underestimating the weight causes moka to allow far more entries than intended,
 // growing actual heap well beyond the configured budget.
 
-fn account_weigher(_k: &(u64, Address), _v: &Option<AccountInfo>) -> u32 {
-    // key: (u64=8, Address=20) = 28 bytes
+fn account_weigher(_k: &Address, _v: &Option<AccountInfo>) -> u32 {
+    // key: Address = 20 bytes
     // value: Option<AccountInfo> (nonce:u64, balance:U256, code_hash:B256, code:None) ≈ 80 bytes
     // moka overhead ≈ 100 bytes
-    // total ≈ 208 → round to 200
+    // total ≈ 200
     200
 }
 
-fn storage_weigher(_k: &(u64, Address, U256), _v: &U256) -> u32 {
-    // key: (u64=8, Address=20, U256=32) = 60 bytes
+fn storage_weigher(_k: &(Address, U256), _v: &U256) -> u32 {
+    // key: (Address=20, U256=32) = 52 bytes
     // value: U256 = 32 bytes
     // moka overhead ≈ 100 bytes
-    // total ≈ 192 → round to 200
-    200
+    // total ≈ 184 → round to 192
+    192
 }
 
 fn bytecode_weigher(_k: &B256, v: &Bytecode) -> u32 {
@@ -37,10 +37,10 @@ fn bytecode_weigher(_k: &B256, v: &Bytecode) -> u32 {
 /// Cross-worker shared read cache.
 #[derive(Debug)]
 pub struct GlobalSharedCache {
-    /// (epoch_id, address) -> Option<AccountInfo> (negative-cache aware)
-    accounts: Cache<(u64, Address), Option<AccountInfo>>,
-    /// (epoch_id, address, slot) -> value
-    storage: Cache<(u64, Address, U256), U256>,
+    /// address -> Option<AccountInfo> (negative-cache aware)
+    accounts: Cache<Address, Option<AccountInfo>>,
+    /// (address, slot) -> value
+    storage: Cache<(Address, U256), U256>,
     /// code_hash -> bytecode
     bytecodes: Cache<B256, Bytecode>,
 }
@@ -52,24 +52,9 @@ impl GlobalSharedCache {
         let account_budget = total_bytes.saturating_mul(25) / 100;
         let bytecode_budget = total_bytes.saturating_sub(storage_budget + account_budget);
 
-        // Ethereum produces one block every ~12 seconds.  Entries keyed by epoch_id
-        // become unreachable as soon as the epoch advances, so we evict them after
-        // EPOCH_TTI seconds of idleness.  This bounds memory even under sustained
-        // high-insertion bursts where moka's background eviction thread cannot keep
-        // pace with max_capacity alone (observed: 125 M entries vs 60 M limit).
-        const EPOCH_TTI: Duration = Duration::from_secs(30);
-
         Arc::new(Self {
-            accounts: Cache::builder()
-                .max_capacity(account_budget)
-                .weigher(account_weigher)
-                .time_to_idle(EPOCH_TTI)
-                .build(),
-            storage: Cache::builder()
-                .max_capacity(storage_budget)
-                .weigher(storage_weigher)
-                .time_to_idle(EPOCH_TTI)
-                .build(),
+            accounts: Cache::builder().max_capacity(account_budget).weigher(account_weigher).build(),
+            storage: Cache::builder().max_capacity(storage_budget).weigher(storage_weigher).build(),
             bytecodes: Cache::builder()
                 .max_capacity(bytecode_budget)
                 .weigher(bytecode_weigher)
@@ -79,21 +64,17 @@ impl GlobalSharedCache {
 
     pub fn get_or_load_account<F>(
         &self,
-        epoch_id: u64,
         address: Address,
         load: F,
     ) -> Result<Option<AccountInfo>, ProviderError>
     where
         F: FnOnce() -> Result<Option<AccountInfo>, ProviderError>,
     {
-        self.accounts
-            .try_get_with((epoch_id, address), load)
-            .map_err(|arc_err| (*arc_err).clone())
+        self.accounts.try_get_with(address, load).map_err(|arc_err| (*arc_err).clone())
     }
 
     pub fn get_or_load_storage<F>(
         &self,
-        epoch_id: u64,
         address: Address,
         slot: U256,
         load: F,
@@ -101,9 +82,7 @@ impl GlobalSharedCache {
     where
         F: FnOnce() -> Result<U256, ProviderError>,
     {
-        self.storage
-            .try_get_with((epoch_id, address, slot), load)
-            .map_err(|arc_err| (*arc_err).clone())
+        self.storage.try_get_with((address, slot), load).map_err(|arc_err| (*arc_err).clone())
     }
 
     pub fn get_or_load_bytecode<F>(&self, code_hash: B256, load: F) -> Result<Bytecode, ProviderError>
@@ -113,20 +92,56 @@ impl GlobalSharedCache {
         self.bytecodes.try_get_with(code_hash, load).map_err(|arc_err| (*arc_err).clone())
     }
 
-    pub fn eager_prefetch(&self, _new_epoch_id: u64, _safe_set: &SafeUnchangedSet) {
-        // no-op in Phase 2
+    /// 精确失效：仅驱逐 diff 中变更的账户与存储槽。
+    /// Commit 走精确失效；Reorg 走全量失效。
+    pub fn on_epoch_change_diff<N>(&self, notification: &CanonStateNotification<N>)
+    where
+        N: reth_node_api::NodePrimitives,
+    {
+        match notification {
+            CanonStateNotification::Reorg { .. } => {
+                self.accounts.invalidate_all();
+                self.storage.invalidate_all();
+            }
+            CanonStateNotification::Commit { new } => {
+                for (address, account) in new.execution_outcome().bundle_accounts_iter() {
+                    self.accounts.invalidate(&address);
+                    for (slot, _) in account.storage.iter() {
+                        self.storage.invalidate(&(address, *slot));
+                    }
+                }
+            }
+        }
     }
 
-    /// Immediately schedule all epoch-keyed entries for eviction.
+    /// 预填充：将 diff 新值直接写入缓存，减少切块后首批 DB 读取。
     ///
-    /// Called when the canonical head advances to a new block. Entries keyed by
-    /// the old epoch_id will never be accessed again, so there is no reason to
-    /// keep them in memory.  `bytecodes` is intentionally excluded: its key is
-    /// just a B256 code_hash with no epoch component, so bytecodes remain valid
-    /// across epoch boundaries.
-    ///
-    /// `invalidate_all` is O(1) – it schedules eviction; the background
-    /// housekeeper performs the actual removal asynchronously.
+    /// 调用顺序要求：先 `on_epoch_change_diff()`，再 `pre_fill_diff()`。
+    pub fn pre_fill_diff<N>(&self, notification: &CanonStateNotification<N>)
+    where
+        N: reth_node_api::NodePrimitives,
+    {
+        let CanonStateNotification::Commit { new } = notification else {
+            return;
+        };
+
+        for (address, account) in new.execution_outcome().bundle_accounts_iter() {
+            if account.status.was_destroyed() {
+                // 销毁账户：保留失效结果，不做预填充，后续读会落到 DB 并形成负缓存。
+                continue;
+            }
+
+            if let Some(info) = account.info.as_ref() {
+                self.accounts.insert(address, Some(info.clone()));
+            }
+
+            for (slot, storage_slot) in account.storage.iter() {
+                self.storage.insert((address, *slot), storage_slot.present_value);
+            }
+        }
+    }
+
+    /// Phase 2 全量失效路径，Phase 3 作为回退保留。
     pub fn on_epoch_change(&self) {
         self.accounts.invalidate_all();
         self.storage.invalidate_all();
@@ -158,7 +173,9 @@ impl SafeUnchangedSet {
 mod tests {
     use super::*;
     use crate::worker::cache::WorkerL1Cache;
-    use alloy_primitives::{Address, B256, Bytes, U256};
+    use alloy_primitives::{map::HashMap, Address, B256, Bytes, U256};
+    use reth_chain_state::CanonStateNotification;
+    use reth_revm::db::{states::StorageSlot, AccountStatus, BundleAccount};
     use revm::{bytecode::Bytecode, state::AccountInfo};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -177,7 +194,7 @@ mod tests {
                 let cache = cache.clone();
                 let cc = call_count.clone();
                 std::thread::spawn(move || {
-                    cache.get_or_load_account(1_u64, addr, move || {
+                    cache.get_or_load_account(addr, move || {
                         cc.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(Duration::from_millis(10));
                         Ok(Some(AccountInfo { nonce: 42, ..Default::default() }))
@@ -196,28 +213,69 @@ mod tests {
     }
 
     #[test]
-    fn test_epoch_namespace_isolation() {
+    fn test_diff_invalidation() {
         let cache = GlobalSharedCache::new(256);
-        let addr = Address::from([0x02u8; 20]);
+        let changed_addr = Address::from([0x02u8; 20]);
+        let unchanged_addr = Address::from([0x03u8; 20]);
+        let changed_slot = U256::from(1_u64);
+        let unchanged_slot = U256::from(2_u64);
 
-        let v1 = cache
-            .get_or_load_account(1_u64, addr, || {
-                Ok(Some(AccountInfo { nonce: 10, ..Default::default() }))
-            })
-            .unwrap();
-        assert_eq!(v1.unwrap().nonce, 10);
+        cache.accounts.insert(changed_addr, Some(AccountInfo { nonce: 10, ..Default::default() }));
+        cache.accounts.insert(
+            unchanged_addr,
+            Some(AccountInfo { nonce: 99, ..Default::default() }),
+        );
+        cache.storage.insert((changed_addr, changed_slot), U256::from(111_u64));
+        cache.storage.insert((unchanged_addr, unchanged_slot), U256::from(999_u64));
 
-        let epoch2_called = Arc::new(AtomicUsize::new(0));
-        let c = epoch2_called.clone();
-        let v2 = cache
-            .get_or_load_account(2_u64, addr, move || {
-                c.fetch_add(1, Ordering::Relaxed);
-                Ok(None)
-            })
-            .unwrap();
+        let mut notification =
+            CanonStateNotification::<reth_ethereum_primitives::EthPrimitives>::Commit {
+                new: Arc::new(Default::default()),
+            };
 
-        assert_eq!(epoch2_called.load(Ordering::Relaxed), 1);
-        assert!(v2.is_none());
+        if let CanonStateNotification::Commit { ref mut new } = notification {
+            let chain = Arc::make_mut(new);
+            let mut changed_storage = HashMap::default();
+            changed_storage.insert(
+                changed_slot,
+                StorageSlot { present_value: U256::from(222_u64), ..Default::default() },
+            );
+            chain.execution_outcome_mut().bundle.state.insert(
+                changed_addr,
+                BundleAccount::new(
+                    Some(AccountInfo { nonce: 10, ..Default::default() }),
+                    Some(AccountInfo { nonce: 77, ..Default::default() }),
+                    changed_storage,
+                    AccountStatus::default(),
+                ),
+            );
+        }
+
+        cache.on_epoch_change_diff(&notification);
+        cache.pre_fill_diff(&notification);
+
+        let changed_info = cache
+            .accounts
+            .get(&changed_addr)
+            .expect("changed account should be present after prefill");
+        assert_eq!(changed_info.expect("changed account info").nonce, 77);
+        assert_eq!(
+            cache.storage.get(&(changed_addr, changed_slot)).expect("changed slot should be present"),
+            U256::from(222_u64),
+        );
+
+        let unchanged_info = cache
+            .accounts
+            .get(&unchanged_addr)
+            .expect("unchanged account should remain cached");
+        assert_eq!(unchanged_info.expect("unchanged account info").nonce, 99);
+        assert_eq!(
+            cache
+                .storage
+                .get(&(unchanged_addr, unchanged_slot))
+                .expect("unchanged slot should remain cached"),
+            U256::from(999_u64),
+        );
     }
 
     #[test]
@@ -225,13 +283,13 @@ mod tests {
         let cache = GlobalSharedCache::new(256);
         let addr = Address::from([0x03u8; 20]);
 
-        let v1 = cache.get_or_load_account(1_u64, addr, || Ok(None)).unwrap();
+        let v1 = cache.get_or_load_account(addr, || Ok(None)).unwrap();
         assert!(v1.is_none());
 
         let db2_called = Arc::new(AtomicUsize::new(0));
         let c = db2_called.clone();
         let v2 = cache
-            .get_or_load_account(1_u64, addr, move || {
+            .get_or_load_account(addr, move || {
                 c.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(AccountInfo { nonce: 99, ..Default::default() }))
             })
@@ -247,7 +305,7 @@ mod tests {
         let addr = Address::from([0x04u8; 20]);
 
         let _ = cache
-            .get_or_load_account(1_u64, addr, || {
+            .get_or_load_account(addr, || {
                 Ok(Some(AccountInfo { nonce: 77, ..Default::default() }))
             })
             .unwrap();
@@ -256,7 +314,7 @@ mod tests {
         let db2_called = Arc::new(AtomicUsize::new(0));
         let c = db2_called.clone();
         let info = cache
-            .get_or_load_account(1_u64, addr, move || {
+            .get_or_load_account(addr, move || {
                 c.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(AccountInfo { nonce: 0, ..Default::default() }))
             })
@@ -280,7 +338,7 @@ mod tests {
         } else {
             let c = l2_called.clone();
             cache
-                .get_or_load_account(1_u64, addr, move || {
+                .get_or_load_account(addr, move || {
                     c.fetch_add(1, Ordering::Relaxed);
                     Ok(None)
                 })
@@ -303,7 +361,7 @@ mod tests {
                 let cache = cache.clone();
                 let cc = call_count.clone();
                 std::thread::spawn(move || {
-                    cache.get_or_load_storage(1_u64, addr, slot, move || {
+                    cache.get_or_load_storage(addr, slot, move || {
                         cc.fetch_add(1, Ordering::Relaxed);
                         std::thread::sleep(Duration::from_millis(10));
                         Ok(U256::from(7_u64))

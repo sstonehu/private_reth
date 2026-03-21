@@ -1,7 +1,7 @@
 use super::{cache::WorkerL1Cache, EthTxEnv, WorkerError, WorkerOutput, WorkerTask};
 use crate::{
     api::types::CallKind,
-    cache::{GlobalSharedCache, SafeUnchangedSet},
+    cache::GlobalSharedCache,
     epoch::EpochContext,
     provider::CachedStateProvider,
 };
@@ -84,7 +84,6 @@ impl MevWorker {
         self.state_provider = Some(provider);
         self.l1.reset(epoch.epoch_id);
         self.current_epoch_id = epoch.epoch_id;
-        self.global_cache.eager_prefetch(epoch.epoch_id, &SafeUnchangedSet::empty());
 
         tracing::debug!(
             target: "reth::mev::worker",
@@ -107,7 +106,6 @@ impl MevWorker {
         let worker_provider = CachedStateProvider {
             l1: &mut self.l1,
             global: self.global_cache.clone(),
-            epoch_id: self.current_epoch_id,
             db: StateProviderDatabase::new(state_provider),
         };
 

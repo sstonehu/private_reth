@@ -1,7 +1,7 @@
 use alloy_consensus::BlockHeader;
 use alloy_eips::{BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{BlockHash, BlockNumber, B256};
-use reth_chain_state::CanonStateSubscriptions;
+use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_chainspec::ChainInfo;
 use reth_evm::ConfigureEvm;
 use reth_storage_api::{
@@ -159,12 +159,16 @@ pub struct EpochManager {
     active_tx: watch::Sender<Arc<EpochContext>>,
     pub active_rx: watch::Receiver<Arc<EpochContext>>,
     debug_fixed_block: Option<BlockNumber>,
+    /// Whether Phase 3 diff-based cache invalidation is active.
+    /// Set MEV_DIFF_CACHE=0 to fall back to Phase 2 full invalidation.
+    diff_cache_enabled: bool,
 }
 
 impl std::fmt::Debug for EpochManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EpochManager")
             .field("current_epoch_id", &self.active_rx.borrow().epoch_id)
+            .field("diff_cache_enabled", &self.diff_cache_enabled)
             .field("current_block_number", &self.active_rx.borrow().block_number)
             .field("debug_fixed_block", &self.debug_fixed_block)
             .finish_non_exhaustive()
@@ -210,9 +214,8 @@ impl EpochManager {
 
     /// 启动后台任务：监听 canonical state，维护 active epoch。
     ///
-    /// `global_cache` is invalidated on every epoch change so that stale
-    /// epoch-keyed entries (account and storage slots) are evicted promptly
-    /// rather than waiting for TTI expiry.
+    /// `global_cache` applies precise diff invalidation and prefill on every
+    /// canonical notification so unchanged entries stay warm across epochs.
     pub fn spawn<P>(
         provider: P,
         evm_config: reth_evm_ethereum::EthEvmConfig,
@@ -231,12 +234,24 @@ impl EpochManager {
             .ok()
             .and_then(|value| value.parse::<BlockNumber>().ok());
 
+        // MEV_DIFF_CACHE=0 falls back to Phase 2 full invalidation on every block.
+        // All other values (including unset) keep Phase 3 diff-based invalidation.
+        let diff_cache_enabled =
+            std::env::var("MEV_DIFF_CACHE").map(|v| v != "0").unwrap_or(true);
+
+        tracing::info!(
+            target: "reth::mev::epoch",
+            diff_cache_enabled,
+            "EpochManager starting"
+        );
+
         let initial = Arc::new(EpochContext::placeholder());
         let (active_tx, active_rx) = watch::channel(initial);
 
-        let manager = Arc::new(Self { active_tx, active_rx, debug_fixed_block });
+        let manager = Arc::new(Self { active_tx, active_rx, debug_fixed_block, diff_cache_enabled });
         let manager_clone = Arc::clone(&manager);
         let fixed_block = debug_fixed_block;
+        let diff_cache = diff_cache_enabled;
 
         tokio::spawn(async move {
             if let Some(block_num) = fixed_block {
@@ -323,18 +338,38 @@ impl EpochManager {
                             state_provider_factory: Arc::new(provider.clone()),
                         });
 
-                        // Evict all stale epoch-keyed cache entries before
-                        // advertising the new epoch.  Entries from the old
-                        // epoch_id will never be queried again; releasing them
-                        // now prevents unbounded heap growth under burst load.
-                        global_cache.on_epoch_change();
+                        let warmup_start = std::time::Instant::now();
+                        if diff_cache {
+                            global_cache.on_epoch_change_diff(&notification);
+                            global_cache.pre_fill_diff(&notification);
+                        } else {
+                            // Phase 2 fallback: full invalidation (MEV_DIFF_CACHE=0).
+                            global_cache.on_epoch_change();
+                        }
+                        let warmup_secs = warmup_start.elapsed().as_secs_f64();
+                        metrics::histogram!("mev_epoch_warmup_duration_seconds")
+                            .record(warmup_secs);
+                        metrics::gauge!("mev_epoch_warmup_duration_latest_seconds")
+                            .set(warmup_secs);
+
+                        if let CanonStateNotification::Commit { ref new } = notification {
+                            let diff_accounts =
+                                new.execution_outcome().bundle_accounts_iter().count() as f64;
+                            let diff_slots: f64 = new
+                                .execution_outcome()
+                                .bundle_accounts_iter()
+                                .map(|(_, account)| account.storage.len() as f64)
+                                .sum();
+                            metrics::gauge!("mev_epoch_diff_accounts_total")
+                                .set(diff_accounts);
+                            metrics::gauge!("mev_epoch_diff_storage_slots_total").set(diff_slots);
+                        }
 
                         let _ = manager_clone.active_tx.send(epoch);
 
                         // ── t1: epoch published, MEV workers can now serve ──
                         // Segment 2: EpochManager processing delay.
-                        // = build_block_env + build_epoch + on_epoch_change
-                        // In Phase 3 this will also include cache pre-warming.
+                        // = build_block_env + build_epoch + on_epoch_change_diff + pre_fill_diff.
                         let epoch_manager_delay_secs = t0_instant.elapsed().as_secs_f64();
 
                         // Total delay = net_engine + epoch_manager

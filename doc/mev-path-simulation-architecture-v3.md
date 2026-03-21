@@ -109,6 +109,8 @@ crates/mev/
 - **SafeUnchangedSet**：由 ExEx 从链上事件构建，仅纳入可严格证明未变的 key，允许不完整，宁漏不错。该能力在 **Phase 2** 引入，Phase 1 无跨 epoch 继承。
 - **原因**：Eager Prefetch 使读路径保持 3 步无分支（Worker-L1 → GlobalSharedCache → DB），同时避免切块导致的首批延迟抖动。
 
+> **⚡ Phase 3 关键发现**：`CanonStateNotification` 中的 `Chain` 自带 `execution_outcome().bundle_accounts_iter()`，包含该区块每个发生变更的账户及存储槽的完整 diff。利用此 diff 可做到**精确失效**：仅驱逐真正变更的条目，所有未变条目跨 epoch 直接复用——无需 `epoch_id` 作 key，也无需 ExEx SafeUnchangedSet。这彻底替代了 Eager Prefetch 方案，将切块后命中率从"SafeUnchangedSet 覆盖率"提升至近 100%（未变账户）。详见 [Phase 3 详细设计](./Reth_simulate_optimize_phase3.md)。
+
 ---
 
 ## 5. 总体架构图（Phase 2 全量）
@@ -268,13 +270,14 @@ sequenceDiagram
 
 #### 缓存对象与 Key
 
-| 类型 | Key |
-|---|---|
-| AccountInfo（nonce/balance/code_hash）| `(epoch_id, address)` |
-| Bytecode | `(epoch_id, code_hash)` |
-| StorageValue | `(epoch_id, address, slot)` |
+| 类型 | Phase 2 Key | Phase 3 Key（Diff 精确失效）|
+|---|---|---|
+| AccountInfo（nonce/balance/code_hash）| `(epoch_id, address)` | `address` |
+| Bytecode | `code_hash` | `code_hash`（不变） |
+| StorageValue | `(epoch_id, address, slot)` | `(address, slot)` |
 
-> `Bytecode` 内容不可变，可在 epoch 间全局复用（以 `code_hash` 去重，不需带 `epoch_id`）。
+> **Phase 2**：key 带 `epoch_id` 保证隔离，切块时 `invalidate_all()` 全量驱逐旧 epoch 条目，SafeUnchangedSet + Eager Prefetch 将热点迁入新 epoch。  
+> **Phase 3**：移除 `epoch_id`，切块时仅 `invalidate(address)` / `invalidate((address, slot))` 驱逐 diff 涉及的条目，未变条目自动延续至新 epoch。`Bytecode` 两阶段均无 `epoch_id`（内容不可变）。
 
 #### 缓存分层
 
@@ -314,7 +317,7 @@ EVM 请求 read(key)
 
 ---
 
-### 5.4 ExEx Delta Warm（Phase 2 引入）
+### 5.4 ExEx Delta Warm（Phase 2 引入，Phase 3 简化）
 
 **职责**：在新块到达时，主动预热 GlobalReadCache，缩短首批延迟。
 
@@ -322,6 +325,8 @@ EVM 请求 read(key)
 - **增量预热**：每新块仅预热热点 key（由 access trace / 白名单池集合 / 协议事件信号决定）。
 - **SafeUnchangedSet 构建**：通过事件日志识别"未发生交易"的 DEX pool，纳入安全继承集合。
 - **重组处理**：回滚受影响 epoch 的 overlay 和 SafeUnchangedSet，重建新分支热数据。
+
+> **Phase 3 简化**：精确 Diff 失效方案使 SafeUnchangedSet 构建逻辑不再必要——链上 diff 本身已提供完整的变更集合，ExEx 可退化为纯预填充（直接将 diff 新值写入缓存），无需维护 SafeUnchangedSet。详见 [Phase 3 详细设计](./Reth_simulate_optimize_phase3.md)。
 
 ---
 
@@ -336,8 +341,8 @@ EVM 请求 read(key)
 | `eth_call` | `mev_eth_call` | Phase 1 | 单笔调用，走 worker pool |
 | `debug_traceCall` | `mev_debug_traceCall` | Phase 1 | 带 debug trace，走 worker pool |
 | `trace_call` | `mev_trace_call` | Phase 1 | 带 parity trace，走 worker pool |
-| —（无原生批量） | `mev_callBatch` | Phase 3 | 多笔独立调用，单次 IPC 处理 |
-| —（无原生批量） | `mev_callBundleBatch` | Phase 3 | bundle 批量，单次 IPC 处理 |
+| —（无原生批量） | `mev_callBatch` | 待规划 | 多笔独立调用，单次 IPC 处理 |
+| —（无原生批量） | `mev_callBundleBatch` | 待规划 | bundle 批量，单次 IPC 处理 |
 
 ### 7.2 Phase 1 接口（单次调用，传输层沿用 JSON-RPC batch）
 
@@ -516,29 +521,75 @@ flowchart LR
 
 ---
 
-### Phase 3：自定义 IPC 批量接口（2~4 周）
+### Phase 3：精确 Diff 缓存失效（2~3 周）
 
-**目标**：消除 JSON-RPC 逐笔开销，实现真正的单次调用处理整批任务。
+> 📄 **详细设计文档**：[Reth_simulate_optimize_phase3.md](./Reth_simulate_optimize_phase3.md)
+
+**目标**：利用链上执行 diff 实现精确缓存失效，将切块后命中率从 SafeUnchangedSet 覆盖率提升至近 100%，切块首批延迟趋近于稳态延迟。
 
 **实施内容**
 
-- 在 `crates/mev/` 内实现 `mev_callBatch` / `mev_callBundleBatch`（真正批量语义，内部并发执行）
-- 自定义 UDS 传输协议（MessagePack 或自定义帧，旁路 JSON-RPC）
-- 客户端从 JSON-RPC batch 迁移到批量接口；保留 Phase 1 的单笔 `mev_*` 接口兼容
-- 对 Reth 原有代码零新增修改
+- **Diff 精确失效**（取代 `invalidate_all()` + SafeUnchangedSet + Eager Prefetch）
+  - 移除 GlobalSharedCache `accounts` / `storage` key 中的 `epoch_id`
+  - `EpochManager` 接收完整 `CanonStateNotification`，调用 `on_epoch_change_diff(notification)`
+  - Commit 通知：仅失效 `execution_outcome().bundle_accounts_iter()` 中的变更条目
+  - Reorg 通知：`invalidate_all()` 保守处理（reorg 小概率，不必优化）
+- **Diff 预填充**（Zero-DB-read epoch transition）
+  - Commit 通知后，将 diff 中的**新值**直接写入 GlobalSharedCache，无需 DB 读
+  - 切块后 worker 首批请求：变更账户命中 pre-fill，未变账户命中遗留缓存，DB 穿透接近零
+- **指标完善**
+  - 新增 `mev_epoch_warmup_duration_seconds`（diff invalidate + pre-fill 耗时）
+  - `mev_epoch_manager_delay_us` 将包含此预热时间
 
 **验收**
 
-- `mev_callBatch` 单次调用 1 万路径，端到端延迟相比 Phase 2 有可测量下降。
-- Phase 1/2 全部功能在新接口下行为一致。
+- 切块后首批请求 GlobalSharedCache 命中率 > 95%，DB 穿透数 ≤ diff 变更账户数（约 500 条）。
+- 切块首批 `T_batch_core` P99 与稳态 P99 差距 < 20ms。
+- 正确性：连续 100 个区块与原生 `eth_call` 结果完全一致。
 
 ---
 
 ## 12. 关键实现提示（Rust）
 
 - `GlobalReadCache` 全局实例用 `Arc<GlobalReadCache>` 传递，内部用分片并发 map（如 `DashMap` 或 `moka`）。
-- 所有缓存 entry 必须带 `epoch_id` 或等价版本戳，禁止无版本复用。
+- **Phase 2**：所有缓存 entry 必须带 `epoch_id`，禁止无版本复用。**Phase 3**：移除 `epoch_id`，改用 diff 失效保证一致性。
 - `CachedStateProvider` 实现 `revm` 的 `Database` trait，封装在 `CacheDB` 之下。
 - Worker 切换 epoch 时只替换 `Arc<EpochHandle>`，避免任何堆上大对象的克隆。
 - 每个阶段保留 feature flag，便于灰度和快速回滚。
-- 先保证正确性再优化：Phase 1 先不引入缓存层，Phase 2 再叠加缓存后做正确性回归。
+- 先保证正确性再优化：Phase 1 先不引入缓存层，Phase 2 再叠加缓存后做正确性回归，Phase 3 移除 epoch_id 后必须做完整的链上重放对照测试。
+
+---
+
+## 13. 设计决策记录：为何不复用 Engine 的 ExecutionCache
+
+Reth engine 模块内置了 `ExecutionCache`（基于 `fixed_cache`）和 `PayloadExecutionCache`，已包含完整的 account / storage / bytecode 缓存层，且在 pre-warming 阶段已对下一块的热点数据做了预填充。曾评估是否可以用它直接替代 MEV 的 `GlobalSharedCache`，结论是**不可行**，根本原因是并发模型冲突：
+
+### 13.1 写覆盖导致正确性破坏（最致命）
+
+`ExecutionCache` 底层是 `Arc<ExecutionCacheInner>`，`clone()` 只增加引用计数，不复制数据。Engine 处理 Block N+1 时，会向同一个 `Arc` 写入 pre-warm 数据和 `insert_state(bundle_N+1)` 的结果。若 MEV workers 持有该 Arc 的克隆，则在模拟 Block N 时会静默读到 Block N+1 的状态——无报错，结果错误。
+
+```
+Engine 的写入模式：单块执行窗口内顺序写，写完即交还
+MEV 的读取模式：整个 epoch（12s）内 60 workers 持续并发读
+
+两者时间重叠时，Engine 写 N+1 覆盖 MEV 正在读的 N 的数据
+```
+
+### 13.2 排他性约束与 MEV 持有时间不兼容
+
+`PayloadExecutionCache::get_cache_for()` 要求 `is_available()`（`Arc::strong_count == 1`），即无其他持有者。MEV workers 在整个 epoch 内需要持有引用，导致 Engine 在处理下一块时拿不到缓存，自身 pre-warm 退化为冷启动——反而破坏了 Engine 自身的性能。
+
+### 13.3 `fixed_cache` 不支持遍历，深拷贝路线被封死
+
+`fixed_cache` 文档明确声明 `No iteration: Individual entries cannot be enumerated`，无法通过遍历做深拷贝来产生一份独立副本供 MEV 独占使用。
+
+### 13.4 结论与正确方案
+
+| 复用方式 | 可行性 | 原因 |
+|----------|--------|------|
+| `Arc::clone` 共享实例 | ❌ | 写覆盖导致正确性破坏 |
+| 深拷贝独立副本 | ❌ | `fixed_cache` 无遍历 API |
+| 借用时间窗口（canonical 后、N+1 pre-warm 前）| ❌ | 窗口 < 几毫秒，不可依赖 |
+| **复用 `insert_state` 逻辑填充 MEV 自有缓存** | ✅ | Phase 3 `pre_fill_diff` 采用此方案 |
+
+**正确做法**：MEV 维护自己独立的 `GlobalSharedCache`（moka，支持并发 + LRU），参照 `ExecutionCache::insert_state` 的实现逻辑（含 SELFDESTRUCT 边界处理）实现 `pre_fill_diff`，共享**设计思路**而非**内存实例**。

@@ -360,9 +360,9 @@ impl EpochManager {
                         tracing::debug!(
                             target: "reth::mev::epoch",
                             block_number = header.number(),
-                            net_engine_delay_ms  = (net_engine_delay_secs  * 1000.0) as u64,
-                            epoch_manager_delay_ms = (epoch_manager_delay_secs * 1000.0) as u64,
-                            total_delay_ms       = (total_delay_secs       * 1000.0) as u64,
+                            block_delay_us             = (net_engine_delay_secs    * 1_000_000.0) as u64,
+                            mev_epoch_manager_delay_us = (epoch_manager_delay_secs * 1_000_000.0) as u64,
+                            mev_block_delay_us         = (total_delay_secs         * 1_000_000.0) as u64,
                             "new epoch ready"
                         );
                     }

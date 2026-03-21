@@ -270,6 +270,16 @@ impl EpochManager {
             loop {
                 match notifications.recv().await {
                     Ok(notification) => {
+                        // ── t0: canonical notification arrived ───────────────
+                        // Captures the wall-clock time at which the Engine API
+                        // has finished processing the block and reth's internal
+                        // pipeline has committed it to canonical chain.
+                        // net_engine_delay = t0 - block.timestamp
+                        //   ≈ network propagation + Engine API (newPayload /
+                        //     forkchoiceUpdated) + reth pipeline time.
+                        let t0_wall = std::time::SystemTime::now();
+                        let t0_instant = std::time::Instant::now();
+
                         let Some(tip) = notification.tip_checked() else {
                             tracing::warn!(
                                 target: "reth::mev::epoch",
@@ -279,6 +289,16 @@ impl EpochManager {
                         };
 
                         let header = tip.header();
+
+                        // Segment 1: network + Engine API delay.
+                        // Measured at notification arrival, before any MEV
+                        // processing, so it does NOT include EpochManager work
+                        // or (future Phase 3) cache pre-warming.
+                        let net_engine_delay_secs = t0_wall
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| (d.as_secs_f64() - header.timestamp() as f64).max(0.0))
+                            .unwrap_or(0.0);
+
                         let block_env = match evm_config.evm_env(header) {
                             Ok(env) => env,
                             Err(err) => {
@@ -293,6 +313,7 @@ impl EpochManager {
 
                         epoch_counter = epoch_counter.saturating_add(1);
                         let spec_id = *block_env.spec_id();
+
                         let epoch = Arc::new(EpochContext {
                             epoch_id: epoch_counter,
                             block_number: header.number(),
@@ -309,6 +330,41 @@ impl EpochManager {
                         global_cache.on_epoch_change();
 
                         let _ = manager_clone.active_tx.send(epoch);
+
+                        // ── t1: epoch published, MEV workers can now serve ──
+                        // Segment 2: EpochManager processing delay.
+                        // = build_block_env + build_epoch + on_epoch_change
+                        // In Phase 3 this will also include cache pre-warming.
+                        let epoch_manager_delay_secs = t0_instant.elapsed().as_secs_f64();
+
+                        // Total delay = net_engine + epoch_manager
+                        let total_delay_secs = net_engine_delay_secs + epoch_manager_delay_secs;
+
+                        metrics::histogram!("mev_net_engine_delay_seconds")
+                            .record(net_engine_delay_secs);
+                        metrics::gauge!("mev_net_engine_delay_latest_seconds")
+                            .set(net_engine_delay_secs);
+
+                        metrics::histogram!("mev_epoch_manager_delay_seconds")
+                            .record(epoch_manager_delay_secs);
+                        metrics::gauge!("mev_epoch_manager_delay_latest_seconds")
+                            .set(epoch_manager_delay_secs);
+
+                        // Keep the aggregate metric for dashboards that track
+                        // overall MEV readiness latency end-to-end.
+                        metrics::histogram!("mev_epoch_block_delay_seconds")
+                            .record(total_delay_secs);
+                        metrics::gauge!("mev_epoch_block_delay_latest_seconds")
+                            .set(total_delay_secs);
+
+                        tracing::debug!(
+                            target: "reth::mev::epoch",
+                            block_number = header.number(),
+                            net_engine_delay_ms  = (net_engine_delay_secs  * 1000.0) as u64,
+                            epoch_manager_delay_ms = (epoch_manager_delay_secs * 1000.0) as u64,
+                            total_delay_ms       = (total_delay_secs       * 1000.0) as u64,
+                            "new epoch ready"
+                        );
                     }
                     Err(err) => {
                         tracing::error!(

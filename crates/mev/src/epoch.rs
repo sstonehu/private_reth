@@ -438,4 +438,20 @@ impl EpochManager {
             Some(BlockId::Hash(hash)) => hash.block_hash == self.active_rx.borrow().block_hash,
         }
     }
+
+    /// 返回请求块号与 active epoch 的差值（仅对 explicit Number 有意义）。
+    ///
+    /// 用于降级路径上区分两种情况：
+    /// - gap = 1：正常排空——新块到来时旧 in-flight 请求自然滞后一块，属预期行为。
+    /// - gap ≥ 2：管道积压异常——Bot 处理管道堵塞，需告警。
+    ///
+    /// 返回 None 表示 block_id 不是 explicit Number（latest / hash / none 等），
+    /// 这类请求走 matches_active 的其他分支，不会因块号失配而降级，无需分类。
+    pub fn block_gap(&self, block_id: Option<BlockId>) -> Option<u64> {
+        let active = self.active_rx.borrow().block_number;
+        match block_id {
+            Some(BlockId::Number(BlockNumberOrTag::Number(n))) => Some(active.saturating_sub(n)),
+            _ => None,
+        }
+    }
 }

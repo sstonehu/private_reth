@@ -1011,6 +1011,82 @@
       ],
       "title": "② EpochManager+预热 延迟趋势（canonical 通知到达 → epoch 就绪）",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 },
+      "id": 20,
+      "title": "降级 Gap 分析（drain=正常排空 / stale=管道积压告警）",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 0,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 1 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "drain（gap=1，正常排空）" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "stale（gap≥2，管道积压 ⚠ 告警）" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#F2495C", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "non_number（非块号类降级）" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#8AB8FF", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max", "mean"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(reth_mev_degraded_gap_total{method=\"eth_call\", reason=\"drain\"}[30s])",
+          "legendFormat": "drain（gap=1，正常排空）",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(reth_mev_degraded_gap_total{method=\"eth_call\", reason=\"stale\"}[30s])",
+          "legendFormat": "stale（gap≥2，管道积压 ⚠ 告警）",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "rate(reth_mev_degraded_gap_total{method=\"eth_call\", reason=\"non_number\"}[30s])",
+          "legendFormat": "non_number（非块号类降级）",
+          "refId": "C"
+        }
+      ],
+      "title": "eth_call 降级 Gap 构成（绿=正常排空 gap=1 / 红=管道积压 gap≥2，红色出现即告警）",
+      "type": "timeseries"
     }
   ]
 }

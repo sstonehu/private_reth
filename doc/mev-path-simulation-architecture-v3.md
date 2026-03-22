@@ -593,3 +593,37 @@ MEV 的读取模式：整个 epoch（12s）内 60 workers 持续并发读
 | **复用 `insert_state` 逻辑填充 MEV 自有缓存** | ✅ | Phase 3 `pre_fill_diff` 采用此方案 |
 
 **正确做法**：MEV 维护自己独立的 `GlobalSharedCache`（moka，支持并发 + LRU），参照 `ExecutionCache::insert_state` 的实现逻辑（含 SELFDESTRUCT 边界处理）实现 `pre_fill_diff`，共享**设计思路**而非**内存实例**。
+
+---
+
+## 14. 环境变量参考
+
+所有 MEV 模块配置均通过环境变量注入，无需修改代码或重新编译。节点启动时各变量会写入日志，便于核查。
+
+| 变量名 | 默认值 | 作用 | 备注 |
+|--------|--------|------|------|
+| `MEV_WORKER_COUNT` | `40` | EVM Worker Pool 的 worker 线程数。建议设为物理核心数的 60%~80%，为 Tokio / Engine 预留余量。 | 过多会导致 CPU 竞争，过少会使任务排队延迟上升 |
+| `MEV_GLOBAL_CACHE_MAX_MB` | `16384`（16 GB）| `GlobalSharedCache` 总内存上限（MB）。内部按 account 25% / storage 70% / bytecode 5% 三段分配。 | 建议不超过可用内存的 50%；按字节权重 LRU 淘汰，超限后自动驱逐 |
+| `MEV_STATS_INTERVAL_SECS` | `30` | 周期性 `tracing::info` 统计日志的输出间隔（秒）。日志包含各 `mev_*` 方法的总量、增量、降级率、错误率及缓存条目数。 | 设为 `0` 无效，最小生效值为 1 |
+| `MEV_DEBUG_FIXED_EPOCH` | 未设置 | **仅用于调试**：将 EpochManager 冻结在指定区块高度，所有 `mev_*` 请求始终使用该块的状态。设置后节点不再跟随链头推进。 | ⚠️ 禁止在生产环境设置；启动时会打印 `WARN` 日志警告 |
+| `MEV_DIFF_CACHE` | `1`（启用） | **灰度开关**：控制 Phase 3 精确 Diff 缓存失效逻辑。`1`（或未设置）= Phase 3 启用（`on_epoch_change_diff` + `pre_fill_diff`）；`0` = 回退 Phase 2 全量失效（`invalidate_all()`）。 | 生产遇到问题时，`systemd` 加 `Environment=MEV_DIFF_CACHE=0` 重启即可回退，无需重新部署二进制 |
+
+### 典型配置示例（`systemd` service）
+
+```ini
+[Service]
+Environment=MEV_WORKER_COUNT=32
+Environment=MEV_GLOBAL_CACHE_MAX_MB=8192
+Environment=MEV_STATS_INTERVAL_SECS=60
+Environment=MEV_DIFF_CACHE=1
+```
+
+### 快速回退 Phase 2
+
+```ini
+# 在 /etc/systemd/system/reth.service.d/override.conf 中追加：
+[Service]
+Environment=MEV_DIFF_CACHE=0
+```
+
+然后 `systemctl daemon-reload && systemctl restart reth`。

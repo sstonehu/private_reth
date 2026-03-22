@@ -328,13 +328,14 @@ Step 2（测试）
   └─ 压测：对比 Phase 2 首批 / 稳态 P50/P95/P99
 
 Step 3（灰度）
-  ├─ Feature flag：mev-phase3-diff-cache（默认关闭）
+  ├─ 环境变量开关：MEV_DIFF_CACHE=0 回退 Phase 2，默认值 1（启用 Phase 3）
   ├─ 开启后观察 mev_epoch_diff_accounts_total + mev_epoch_warmup_duration_seconds
-  └─ 确认 GlobalSharedCache 命中率 > 95% 后关闭旧路径
+  ├─ 确认 GlobalSharedCache 命中率 > 95% 后保持 Phase 3
+  └─ 节点启动日志打印 diff_cache_enabled=true/false，便于核查当前生效路径
 
 Step 4（清理）
-  ├─ 移除 on_epoch_change()（旧 Phase 2 全量失效）
-  ├─ 移除 CachedStateProvider 中的 epoch_id 字段（若 Worker-L1 也不再需要）
+  ├─ 稳定运行若干天后，可移除 on_epoch_change()（旧 Phase 2 全量失效）
+  ├─ WorkerL1Cache 中的 epoch_id 仍用于 worker 侧 epoch 切换检测，保留
   └─ 更新设计文档
 ```
 
@@ -395,6 +396,11 @@ Step 4（清理）
    - `mev_epoch_warmup_duration_latest_seconds`
    - `mev_epoch_diff_accounts_total`
    - `mev_epoch_diff_storage_slots_total`
+9. 已新增灰度开关 `MEV_DIFF_CACHE`：
+   - `EpochManager` 结构体新增 `diff_cache_enabled: bool` 字段
+   - `spawn()` 读取环境变量，启动时打印 `INFO` 日志记录当前生效路径
+   - `MEV_DIFF_CACHE=0` 时回退调用 `on_epoch_change()`（Phase 2 全量失效）
+   - 默认值：`1`（Phase 3 启用），无需设置
 
 ### 11.3 测试改动与结果
 
@@ -417,7 +423,7 @@ Step 4（清理）
    - 为纯编译适配，不改变执行语义。
 2. `on_epoch_change_diff` / `pre_fill_diff` 的泛型约束显式写为
    `N: reth_node_api::NodePrimitives`，以满足 `CanonStateNotification<N>` 的 trait bound。
-3. `pre_fill_diff` 插入账户时使用 `Some(info.clone().into())`，用于类型收敛到缓存值类型。
+3. `pre_fill_diff` 插入账户时使用 `Some(info.clone())`，`AccountInfo` 类型与缓存值类型一致，无需 `.into()` 转换。
 
 ### 11.5 约束检查
 

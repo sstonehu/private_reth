@@ -116,6 +116,22 @@ pub fn record_degraded_path(method: &'static str, c: &MethodCounters) {
     metrics::counter!(DEGRADED_PATH_TOTAL, "method" => method).increment(1);
 }
 
+/// Record a degraded request with block-gap classification.
+///
+/// - `gap = None`  : block_id is latest/hash/none — degraded for non-block-number reasons.
+/// - `gap = Some(1)`: normal in-flight drain (new block arrived while request was in flight).
+/// - `gap = Some(n≥2)`: pipeline backup — bot queue is falling behind, alert immediately.
+#[inline]
+pub fn record_degraded_gap(method: &'static str, gap: Option<u64>) {
+    let reason = match gap {
+        None => "non_number",
+        Some(1) => "drain",  // normal: one block behind during epoch transition
+        Some(_) => "stale",  // gap ≥ 2: pipeline backup, needs immediate alert
+    };
+    metrics::counter!("mev_degraded_gap_total", "method" => method, "reason" => reason)
+        .increment(1);
+}
+
 /// Record a worker-side execution error.
 #[inline]
 pub fn record_error(method: &'static str, kind: &'static str, c: &MethodCounters) {

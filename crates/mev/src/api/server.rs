@@ -113,6 +113,7 @@ where
 
         if !self.epoch_manager.matches_active(block_id) {
             metrics::record_degraded_path(method::ETH_CALL, c);
+            metrics::record_degraded_gap(method::ETH_CALL, self.epoch_manager.block_gap(block_id));
             let overrides =
                 alloy_rpc_types_eth::state::EvmOverrides::new(state_overrides, block_overrides);
             let result =
@@ -169,6 +170,7 @@ where
 
         if !self.epoch_manager.matches_active(block_id) {
             metrics::record_degraded_path(method::DEBUG_TRACE, c);
+            metrics::record_degraded_gap(method::DEBUG_TRACE, self.epoch_manager.block_gap(block_id));
             let result = DebugApiServer::debug_trace_call(
                 &self.debug_api,
                 request,
@@ -235,6 +237,7 @@ where
 
         if !self.epoch_manager.matches_active(block_id) {
             metrics::record_degraded_path(method::TRACE_CALL, c);
+            metrics::record_degraded_gap(method::TRACE_CALL, self.epoch_manager.block_gap(block_id));
             let result = TraceApiServer::trace_call(
                 &self.trace_api,
                 request,

@@ -454,4 +454,9 @@ impl EpochManager {
             _ => None,
         }
     }
+
+    /// 返回当前 active epoch 的块号，供 EpochMismatch 错误体使用。
+    pub fn active_block_number(&self) -> u64 {
+        self.active_rx.borrow().block_number
+    }
 }

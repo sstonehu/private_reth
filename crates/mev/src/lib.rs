@@ -1,8 +1,13 @@
-//! `reth-mev` — MEV 路径模拟加速 RPC 扩展（Phase 1）。
+//! `reth-mev` — MEV 路径模拟加速 RPC 扩展（Phase 4）。
 //!
 //! 提供 `mev_eth_call` / `mev_debug_traceCall` / `mev_trace_call` 三个接口，
 //! 请求经 [`EpochManager`] 路由后，投递至独立的 OS 线程 Worker Pool 并行执行 EVM，
 //! 减少对 Tokio async 线程的阻塞。
+//!
+//! - Phase 1: EVM Worker Pool + mev_* 单笔接口
+//! - Phase 2: GlobalSharedCache 全局读缓存
+//! - Phase 3: 精确 Diff 缓存失效（`MEV_DIFF_CACHE`）
+//! - Phase 4: mev_eth_call 过期请求快速拒绝（`MEV_REJECT_STALE_CALL`）
 //!
 //! 使用 [`install_mev_rpc`] 将模块挂载到 Reth 的 `extend_rpc_modules` 钩子。
 #![allow(missing_docs)]
@@ -110,6 +115,10 @@ where
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
+    // MEV_REJECT_STALE_CALL=0 falls back to Phase 3 degradation for mev_eth_call.
+    // All other values (including unset) enable Phase 4 fast rejection.
+    let reject_stale_call =
+        std::env::var("MEV_REJECT_STALE_CALL").map(|v| v != "0").unwrap_or(true);
     metrics::spawn_periodic_reporter(
         counters.clone(),
         global_cache,
@@ -124,6 +133,7 @@ where
         eth_api,
         debug_api,
         trace_api,
+        reject_stale_call,
     }
     .into_rpc();
     ctx.modules.merge_configured(mev_module)?;
@@ -134,7 +144,8 @@ where
         cache_max_mb,
         call_gas_cap = call_config.call_gas_cap,
         stats_interval_secs,
-        "mev RPC module installed (Phase 2: GlobalSharedCache enabled)"
+        reject_stale_call,
+        "mev RPC module installed (Phase 4: eth_call fast rejection enabled)"
     );
 
     Ok(())

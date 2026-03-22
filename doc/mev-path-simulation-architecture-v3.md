@@ -41,11 +41,13 @@ Layer B：共享跨请求读缓存（消除重复 DB 读）
 Layer C：批量 IPC 接口（消除 RPC 调用次数 + 编解码开销）
 ```
 
-对应三个实施阶段：
+对应四个实施阶段：
 
 - **Phase 1**：实现 Layer A，新增 `mev_eth_call` / `mev_debug_traceCall` / `mev_trace_call`，沿用 JSON-RPC batch 传输
-- **Phase 2**：实现 Layer B，在 Phase 1 基础上叠加全局读缓存
-- **Phase 3**：实现 Layer C，新增自定义 IPC 批量接口，替代 JSON-RPC batch
+- **Phase 2**：实现 Layer B，在 Phase 1 基础上叠加全局读缓存（GlobalSharedCache + CachedStateProvider + singleflight）
+- **Phase 3**：精确 Diff 缓存失效，切块后命中率从 SafeUnchangedSet 覆盖率提升至近 100%，首批延迟趋近稳态
+- **Phase 4**：`mev_eth_call` 过期请求快速拒绝（-39001 错误码），切断级联故障的正反馈回路
+- **待规划**：新增自定义 IPC 批量接口（`mev_callBatch` / `mev_callBundleBatch`），替代 JSON-RPC batch
 
 ---
 
@@ -94,8 +96,9 @@ crates/mev/
 ### 3.1 Epoch 策略：一律使用最新块
 
 - **决策**：所有进入优化路径的请求，统一绑定当前 `active_epoch`（最新已提交区块）。
-- **旧块请求**：若请求携带旧 `blockNumber`，不进入 worker pool，降级走原生 `eth_call`。
-- **原因**：简化并发模型，避免复杂的多 epoch 路由；旧块降级可保证语义正确性。
+- **旧块请求（Phase 1~3）**：若请求携带旧 `blockNumber`，不进入 worker pool，降级走原生接口。
+- **旧块请求（Phase 4，仅 `mev_eth_call`）**：不再降级，立即返回 `-39001 EpochMismatch` 错误。trace 接口（`mev_debug_traceCall` / `mev_trace_call`）继续降级走原生接口。
+- **原因**：简化并发模型，避免复杂的多 epoch 路由；`mev_eth_call` 快速拒绝可切断大流量场景下的级联故障正反馈回路。
 
 ### 3.2 Worker 策略：常驻复用，按 epoch 挂载会话
 
@@ -158,14 +161,21 @@ mev_callBatch / mev_callBundleBatch]
 - 通知 WorkerPool 切换目标 epoch。
 - 旧 epoch 按引用计数 + TTL 延迟回收。
 
-**入口路由规则**：
+**入口路由规则（Phase 4）**：
 
 ```
 请求到达
-  └─ 未指定 blockNumber 或指定 == active_epoch.block_number
-       └─ 进入 worker pool 优化路径
-  └─ 指定旧 blockNumber
-       └─ 降级走原生 eth_call（语义正确，不阻塞优化路径）
+  └─ 未指定 blockNumber 或指定 == active_epoch.block_number（gap = 0）
+       └─ 进入 worker pool 优化路径（所有三个接口）
+
+  └─ mev_eth_call + gap ≥ 1
+       └─ [Phase 4] 快速拒绝：返回 -39001 EpochMismatch 错误（< 1ms，无 DB 读）
+
+  └─ mev_debug_traceCall / mev_trace_call + gap = 1（drain）
+       └─ [Phase 4] 进入 worker pool，在当前 epoch N 上执行（路径模拟仍有效）
+
+  └─ mev_debug_traceCall / mev_trace_call + gap ≥ 2（stale）
+       └─ [Phase 4] 快速拒绝：返回 -39001 EpochMismatch 错误
 ```
 
 ---
@@ -396,7 +406,8 @@ EVM 请求 read(key)
 ### 7.4 统一约束
 
 - `mev_*` 优化路径执行版本为 `active_epoch`（未指定 `block_id` 或 `block_id == active_epoch.block_number`）。
-- `block_id` 指定旧块时，请求**原样**降级走对应原生接口（`eth_call` / `debug_traceCall` / `trace_call`），由原生接口按指定 `block_id` 执行，语义正确，不进入 worker pool。
+- **`mev_eth_call`**：`block_id` 指定旧块时，**[Phase 4]** 直接返回 `-39001 EpochMismatch` 错误（不降级，不做任何 DB 读取）。`data` 字段包含 `requestedBlock`、`currentEpoch`、`gap`，供 Bot 快速排空 drain 任务。
+- **`mev_debug_traceCall` / `mev_trace_call`**：**[Phase 4]** gap=1（drain）时进入 worker pool 在当前 epoch N 上执行（路径模拟在最新状态上仍有效）；gap≥2（stale）时返回 `-39001 EpochMismatch` 错误。不再降级走原生接口。
 - 超出限制（最大交易数/bundle 数/返回体积）时返回明确错误码。
 
 ---
@@ -405,9 +416,17 @@ EVM 请求 read(key)
 
 ```mermaid
 flowchart LR
-    A[请求入口] --> CHK{block_id == active_epoch\n或未指定?}
-    CHK -- 是 --> B[任务切分\nShards\n绑定 active_epoch]
-    CHK -- 否\n旧块 --> F[降级走原生接口\neth_call / debug_traceCall / trace_call]
+    A[请求入口] --> MT{接口类型}
+    MT -- mev_eth_call --> CHK1{block_id ==\nactive_epoch\n或未指定?}
+    MT -- mev_debug_traceCall\nmev_trace_call --> CHK2{block_id ==\nactive_epoch\n或未指定?}
+
+    CHK1 -- 是 --> B[任务切分\nShards\n绑定 active_epoch]
+    CHK1 -- 否\ngap ≥ 1 --> ERR1["返回 -39001\nEpochMismatch 错误\n< 1ms，无 DB 读\n[Phase 4]"]
+
+    CHK2 -- 是 --> B
+    CHK2 -- 否\ngap = 1\ndrain --> B
+    CHK2 -- 否\ngap ≥ 2 --> ERR2["返回 -39001\nEpochMismatch 错误\n[Phase 4]"]
+
     B --> W1[Worker 1]
     B --> W2[Worker 2]
     B --> Wn[Worker N]
@@ -470,7 +489,8 @@ flowchart LR
 | `SafeUnchangedSet` 误判（假阳性最危险） | 允许假阴性（少复用）；严格避免假阳性；上线后抽样 DB 对照并可自动降级规则 |
 | 缓存击穿与内存膨胀 | singleflight + 按字节权重淘汰 + 负缓存 TTL + 内存用量指标报警 |
 | Worker 池耗尽 | 有界任务队列 + 背压 + 快速失败（可配置） |
-| 旧 epoch 请求降级后延迟上升 | 降级为原生 `eth_call` 属预期行为；客户端可通过额外的 `eth_blockNumber` 感知当前链头 |
+| 旧 epoch `mev_eth_call` 请求导致级联故障 | [Phase 4] 快速拒绝（-39001），不做 DB 读取；Bot 收到错误后立即排空 drain 任务，切断正反馈回路 |
+| 旧 epoch `mev_debug_traceCall` / `mev_trace_call` 降级后延迟上升 | 降级为原生接口属预期行为；trace 接口调用频率低，降级代价可接受 |
 | 切块瞬间 worker 切换抖动 | worker 完成当前 shard 后再切换，限制单 shard 粒度，避免长尾任务阻塞切换 |
 
 ---
@@ -549,6 +569,31 @@ flowchart LR
 
 ---
 
+### Phase 4：mev_eth_call 过期请求快速拒绝（1~2 天）
+
+> 📄 **详细设计文档**：[Reth_simulate_optimize_phase4.md](./Reth_simulate_optimize_phase4.md)
+
+**目标**：以快速错误（-39001 EpochMismatch）替代对过期 `mev_eth_call` 的降级处理，切断大流量场景下级联故障的正反馈回路。
+
+**实施内容**
+
+- `server.rs`：修改 `mev_eth_call` 降级分支，改为返回 `-39001 EpochMismatch` 错误（包含 `requestedBlock`、`currentEpoch`、`gap` 字段）
+- `server.rs`：新增 `epoch_mismatch_error()` 辅助函数
+- `metrics.rs`：新增 `record_epoch_mismatch()` 函数和 `mev_epoch_mismatch_total` 指标
+- `epoch.rs`：补充 `active_block_number()` 方法（若未暴露）
+- 环境变量开关 `MEV_REJECT_STALE_CALL`（默认 `1`，`0` 回退 Phase 3 降级行为）
+- Grafana：新增 "Epoch Mismatch 快速拒绝" 面板
+- `mev_debug_traceCall` / `mev_trace_call` **不做任何修改**
+
+**验收**
+
+- `mev_eth_call` 过期请求响应时间 < 1ms（无 DB 读）
+- `mev_epoch_mismatch_total{reason="stale"}` 在流量激增时不触发级联（对比 Phase 3 降级率 100% 的历史事件）
+- Bot 侧正确处理 `-39001` 错误，不重试旧 `block_id`
+- `mev_debug_traceCall` 降级行为与 Phase 3 完全一致
+
+---
+
 ## 12. 关键实现提示（Rust）
 
 - `GlobalReadCache` 全局实例用 `Arc<GlobalReadCache>` 传递，内部用分片并发 map（如 `DashMap` 或 `moka`）。
@@ -607,6 +652,7 @@ MEV 的读取模式：整个 epoch（12s）内 60 workers 持续并发读
 | `MEV_STATS_INTERVAL_SECS` | `30` | 周期性 `tracing::info` 统计日志的输出间隔（秒）。日志包含各 `mev_*` 方法的总量、增量、降级率、错误率及缓存条目数。 | 设为 `0` 无效，最小生效值为 1 |
 | `MEV_DEBUG_FIXED_EPOCH` | 未设置 | **仅用于调试**：将 EpochManager 冻结在指定区块高度，所有 `mev_*` 请求始终使用该块的状态。设置后节点不再跟随链头推进。 | ⚠️ 禁止在生产环境设置；启动时会打印 `WARN` 日志警告 |
 | `MEV_DIFF_CACHE` | `1`（启用） | **灰度开关**：控制 Phase 3 精确 Diff 缓存失效逻辑。`1`（或未设置）= Phase 3 启用（`on_epoch_change_diff` + `pre_fill_diff`）；`0` = 回退 Phase 2 全量失效（`invalidate_all()`）。 | 生产遇到问题时，`systemd` 加 `Environment=MEV_DIFF_CACHE=0` 重启即可回退，无需重新部署二进制 |
+| `MEV_REJECT_STALE_CALL` | `1`（启用） | **灰度开关**：控制 Phase 4 `mev_eth_call` 过期请求快速拒绝。`1`（或未设置）= Phase 4 启用，返回 `-39001 EpochMismatch` 错误；`0` = 回退 Phase 3 降级行为（走原生 `eth_call`）。 | Bot 侧适配完成前建议先设 `0` 灰度；确认 Bot 正确处理 `-39001` 后切 `1` |
 
 ### 典型配置示例（`systemd` service）
 
@@ -616,14 +662,23 @@ Environment=MEV_WORKER_COUNT=32
 Environment=MEV_GLOBAL_CACHE_MAX_MB=8192
 Environment=MEV_STATS_INTERVAL_SECS=60
 Environment=MEV_DIFF_CACHE=1
+Environment=MEV_REJECT_STALE_CALL=1
 ```
 
-### 快速回退 Phase 2
+### 快速回退 Phase 2（diff 缓存）
 
 ```ini
 # 在 /etc/systemd/system/reth.service.d/override.conf 中追加：
 [Service]
 Environment=MEV_DIFF_CACHE=0
+```
+
+### 快速回退 Phase 4（eth_call 快速拒绝）
+
+```ini
+# Bot 侧适配前或遇到问题时：
+[Service]
+Environment=MEV_REJECT_STALE_CALL=0
 ```
 
 然后 `systemctl daemon-reload && systemctl restart reth`。

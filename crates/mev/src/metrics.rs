@@ -14,7 +14,10 @@ pub struct MethodCounters {
     pub total: AtomicU64,
     /// Requests routed to the EVM worker pool (active epoch match).
     pub worker: AtomicU64,
-    /// Requests degraded to native eth_call (stale block_id).
+    /// Requests degraded to native fallback (stale block_id).
+    /// Phase 4: no method degrades anymore — all stale requests are either fast-rejected
+    /// (gap >= 2) or promoted to the worker path (gap == 1, trace calls only).
+    /// This counter will remain 0 in normal Phase 4 operation.
     pub degraded: AtomicU64,
     /// Worker execution errors (revert / halt / evm error).
     pub errors: AtomicU64,
@@ -132,6 +135,22 @@ pub fn record_degraded_gap(method: &'static str, gap: Option<u64>) {
         .increment(1);
 }
 
+/// Phase 4: 记录 mev_eth_call 因 epoch mismatch 被快速拒绝的次数。
+///
+/// - `gap = None`  : block_id 非 explicit Number（理论上不会触发拒绝，保险兜底）。
+/// - `gap = Some(1)`: drain——切块时正常在途请求，属预期现象。
+/// - `gap = Some(n≥2)`: stale——Bot 管道出现积压，需告警。
+#[inline]
+pub fn record_epoch_mismatch(method: &'static str, gap: Option<u64>) {
+    let reason = match gap {
+        None => "non_number",
+        Some(1) => "drain", // normal: in-flight drain during epoch transition
+        Some(_) => "stale", // gap ≥ 2: pipeline backup, needs immediate alert
+    };
+    metrics::counter!("mev_epoch_mismatch_total", "method" => method, "reason" => reason)
+        .increment(1);
+}
+
 /// Record a worker-side execution error.
 #[inline]
 pub fn record_error(method: &'static str, kind: &'static str, c: &MethodCounters) {
@@ -162,8 +181,11 @@ pub mod method {
 /// Log format (structured fields, visible in JSON log exporters):
 /// ```text
 /// reth::mev::stats  mev periodic stats
-///   eth_call.total=1234  eth_call.delta=56  eth_call.worker=50
-///   eth_call.degraded=6  eth_call.degraded_pct=10  eth_call.errors=0
+///   eth_call.total=1234  eth_call.delta=56  eth_call.worker=56
+///   eth_call.degraded=0  eth_call.degraded_pct=0  eth_call.errors=0
+///   (Phase 4: eth_call stale requests are fast-rejected, not degraded;
+///    see mev_epoch_mismatch_total for rejection counts)
+///   debug_trace.total=12  debug_trace.degraded=1  ...
 ///   ...
 /// ```
 pub fn spawn_periodic_reporter(

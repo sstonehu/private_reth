@@ -12,7 +12,6 @@ use alloy_rpc_types_trace::{
     parity::{TraceResults, TraceType},
 };
 use jsonrpsee::core::RpcResult;
-use reth_rpc_api::{DebugApiServer, TraceApiServer};
 use reth_rpc_convert::{RpcConvert, RpcTypes};
 use reth_rpc_eth_api::{
     helpers::{EthCall, EthTransactions, TraceExt},
@@ -37,6 +36,10 @@ pub struct MevApiServer<EthApi: RpcNodeCore<Evm = reth_evm_ethereum::EthEvmConfi
     pub eth_api: EthApi,
     pub debug_api: reth_rpc::DebugApi<EthApi>,
     pub trace_api: reth_rpc::TraceApi<EthApi>,
+    /// Phase 4: if true, mev_eth_call with stale block_id returns -39001 immediately
+    /// instead of degrading to the native eth_call path.
+    /// Controlled by MEV_REJECT_STALE_CALL env var (default: true).
+    pub reject_stale_call: bool,
 }
 
 impl<EthApi: RpcNodeCore<Evm = reth_evm_ethereum::EthEvmConfig>> std::fmt::Debug
@@ -48,6 +51,7 @@ impl<EthApi: RpcNodeCore<Evm = reth_evm_ethereum::EthEvmConfig>> std::fmt::Debug
             .field("worker_pool", &self.worker_pool)
             .field("call_config", &self.call_config)
             .field("counters", &self.counters)
+            .field("reject_stale_call", &self.reject_stale_call)
             .finish_non_exhaustive()
     }
 }
@@ -112,8 +116,20 @@ where
         metrics::record_request(method::ETH_CALL, c);
 
         if !self.epoch_manager.matches_active(block_id) {
+            let gap = self.epoch_manager.block_gap(block_id);
+            if self.reject_stale_call {
+                // Phase 4: fast rejection — no DB read, no EVM execution.
+                metrics::record_epoch_mismatch(method::ETH_CALL, gap);
+                metrics::record_e2e_latency(method::ETH_CALL, t0.elapsed());
+                return Err(epoch_mismatch_error(
+                    block_id,
+                    self.epoch_manager.active_block_number(),
+                    gap,
+                ));
+            }
+            // Phase 3 fallback (MEV_REJECT_STALE_CALL=0): degrade to native eth_call.
             metrics::record_degraded_path(method::ETH_CALL, c);
-            metrics::record_degraded_gap(method::ETH_CALL, self.epoch_manager.block_gap(block_id));
+            metrics::record_degraded_gap(method::ETH_CALL, gap);
             let overrides =
                 alloy_rpc_types_eth::state::EvmOverrides::new(state_overrides, block_overrides);
             let result =
@@ -169,17 +185,19 @@ where
         metrics::record_request(method::DEBUG_TRACE, c);
 
         if !self.epoch_manager.matches_active(block_id) {
-            metrics::record_degraded_path(method::DEBUG_TRACE, c);
-            metrics::record_degraded_gap(method::DEBUG_TRACE, self.epoch_manager.block_gap(block_id));
-            let result = DebugApiServer::debug_trace_call(
-                &self.debug_api,
-                request,
-                block_id,
-                Some(opts.unwrap_or_default()),
-            )
-            .await;
-            metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
-            return result;
+            let gap = self.epoch_manager.block_gap(block_id);
+            if gap != Some(1) {
+                // gap >= 2 or non-number block_id: fast rejection.
+                metrics::record_epoch_mismatch(method::DEBUG_TRACE, gap);
+                metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
+                return Err(epoch_mismatch_error(
+                    block_id,
+                    self.epoch_manager.active_block_number(),
+                    gap,
+                ));
+            }
+            // gap == Some(1): drain — fall through to worker path.
+            // Execute on current epoch N; path simulation on latest state remains useful.
         }
 
         metrics::record_worker_path(method::DEBUG_TRACE, c);
@@ -236,19 +254,19 @@ where
         let trace_types: HashSet<_> = trace_types.into_iter().collect();
 
         if !self.epoch_manager.matches_active(block_id) {
-            metrics::record_degraded_path(method::TRACE_CALL, c);
-            metrics::record_degraded_gap(method::TRACE_CALL, self.epoch_manager.block_gap(block_id));
-            let result = TraceApiServer::trace_call(
-                &self.trace_api,
-                request,
-                trace_types,
-                block_id,
-                state_overrides,
-                block_overrides,
-            )
-            .await;
-            metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
-            return result;
+            let gap = self.epoch_manager.block_gap(block_id);
+            if gap != Some(1) {
+                // gap >= 2 or non-number block_id: fast rejection.
+                metrics::record_epoch_mismatch(method::TRACE_CALL, gap);
+                metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
+                return Err(epoch_mismatch_error(
+                    block_id,
+                    self.epoch_manager.active_block_number(),
+                    gap,
+                ));
+            }
+            // gap == Some(1): drain — fall through to worker path.
+            // Execute on current epoch N; path simulation on latest state remains useful.
         }
 
         metrics::record_worker_path(method::TRACE_CALL, c);
@@ -285,4 +303,27 @@ where
         metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
         result
     }
+}
+
+/// 构造 -39001 EpochMismatch JSON-RPC 错误，供 Phase 4 快速拒绝使用。
+fn epoch_mismatch_error(
+    requested: Option<BlockId>,
+    current_epoch: u64,
+    gap: Option<u64>,
+) -> jsonrpsee::types::error::ErrorObject<'static> {
+    let requested_block = match requested {
+        Some(BlockId::Number(alloy_rpc_types_eth::BlockNumberOrTag::Number(n))) => Some(n),
+        _ => None,
+    };
+
+    let mut data = std::collections::BTreeMap::new();
+    data.insert("requestedBlock", requested_block);
+    data.insert("currentEpoch", Some(current_epoch));
+    data.insert("gap", gap);
+
+    jsonrpsee::types::error::ErrorObject::owned(
+        -39001,
+        "epoch mismatch: stale block_id",
+        Some(data),
+    )
 }

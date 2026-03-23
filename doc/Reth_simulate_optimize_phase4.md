@@ -275,37 +275,57 @@ if !self.epoch_manager.matches_active(block_id) {
 
 | 指标名 | 类型 | 含义 |
 |--------|------|------|
-| `mev_epoch_mismatch_total{method, reason}` | Counter | `mev_eth_call` 因 epoch mismatch 被快速拒绝的次数。`reason` = `drain`（gap=1）/ `stale`（gap≥2）/ `non_number` |
+| `mev_epoch_mismatch_total{method, reason}` | Counter | **全量 gap 事件计数**（无论结果是拒绝还是 promote 到 worker）。`reason` = `drain`（gap=1）/ `stale`（gap≥2）/ `non_number` |
+
+`method` 标签隐含了请求的处理方式：
+
+| method | reason=drain | reason=stale |
+|--------|-------------|-------------|
+| `eth_call` | 被快速拒绝（-39001） | 被快速拒绝（-39001） |
+| `debug_traceCall` | 被 promote 到 worker | 被快速拒绝（-39001） |
+| `trace_call` | 被 promote 到 worker | 被快速拒绝（-39001） |
 
 ### 4.2 指标变化说明
 
 | 指标 | Phase 3 行为 | Phase 4 行为 |
 |------|-------------|-------------|
-| `mev_degraded_gap_total{method="mev_eth_call"}` | 有值（降级时记录）| 为零（不再降级） |
-| `mev_epoch_mismatch_total{method="mev_eth_call"}` | 不存在 | 新增，替代上一行 |
-| `mev_degraded_gap_total{method="mev_debug_traceCall"}` | 有值 | 不变（trace 接口继续降级）|
-| `mev_degraded_gap_total{method="mev_trace_call"}` | 有值 | 不变 |
+| `mev_degraded_path_total` | 有值 | **永远为 0**（所有三个接口均无降级） |
+| `mev_degraded_gap_total` | 有值 | **永远为 0** |
+| `mev_epoch_mismatch_total` | 不存在 | **新增**，记录所有 gap 事件（拒绝 + promote）|
+
+> `mev_degraded_*` 指标在 Phase 4 中不会增长，但保留以便：
+> ① 在灰度期（`MEV_REJECT_STALE_CALL=0`）时仍可观察降级回退状态；
+> ② 与 Phase 3 历史数据对比；
+> ③ 回退时恢复监控。
 
 ### 4.3 告警建议
 
 | 条件 | 动作 |
 |------|------|
 | `rate(mev_epoch_mismatch_total{reason="stale"}[1m]) > 5` | 告警：Bot 管道出现异常堆积（gap ≥ 2 超出预期） |
-| `rate(mev_epoch_mismatch_total{reason="drain"}[1m]) / rate(mev_eth_call_total[1m]) > 0.1` | 观察：drain 占比超 10%，Bot 管道较深 |
-| `mev_degraded_gap_total{method="mev_eth_call"}` 仍有增量 | 告警：`MEV_REJECT_STALE_CALL=0` 仍在生效，Phase 4 未启用 |
+| `rate(mev_epoch_mismatch_total{reason="drain"}[1m])` 持续上升 | 观察：切块期 drain 量增加，Bot 管道开始积压 |
+| `mev_degraded_path_total` 仍有增量 | 告警：`MEV_REJECT_STALE_CALL=0` 仍在生效，Phase 4 未启用 |
 
 ### 4.4 Grafana 面板
 
-在现有 "降级 Gap 分析" 行下新增 **"Epoch Mismatch 快速拒绝（Phase 4）"** 面板：
+**用 "Gap 数量分布" 面板替换 Phase 3 的 "降级 Gap 分析" 面板**：
 
 ```promql
+# 主面板：按 method + reason 分组，完整展示所有 gap 事件
+sum(rate(mev_epoch_mismatch_total[1m])) by (method, reason)
+```
+
+```promql
+# 简化面板：只看 reason，判断 drain/stale 比例
 sum(rate(mev_epoch_mismatch_total[1m])) by (reason)
 ```
 
 使用 stacked bars，颜色约定：
-- `drain`：黄色（正常现象，观察）
-- `stale`：红色（异常，需告警）
-- `non_number`：灰色（不常见）
+- `reason=drain`：黄色（观察）——eth_call 被拒；trace 被 promote 到 worker（均属正常）
+- `reason=stale`：红色（告警）——所有接口 gap≥2，管道出现异常积压
+- `reason=non_number`：灰色（罕见）
+
+> **Phase 3 的 "降级 Gap 分析"（`mev_degraded_gap_total`）可从 Grafana 下线**，Phase 4 后该指标不再增长。
 
 ---
 

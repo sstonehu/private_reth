@@ -140,11 +140,22 @@ pub fn record_degraded_gap(method: &'static str, gap: Option<u64>) {
 /// - `gap = None`  : block_id 非 explicit Number（理论上不会触发拒绝，保险兜底）。
 /// - `gap = Some(1)`: drain——切块时正常在途请求，属预期现象。
 /// - `gap = Some(n≥2)`: stale——Bot 管道出现积压，需告警。
+/// Records all non-zero gap events regardless of how they were handled.
+///
+/// This covers the complete gap-count picture:
+/// - `eth_call + reason=drain`  (gap=1) → request was fast-rejected
+/// - `eth_call + reason=stale`  (gap≥2) → request was fast-rejected
+/// - `trace    + reason=drain`  (gap=1) → request was promoted to worker on epoch N
+/// - `trace    + reason=stale`  (gap≥2) → request was fast-rejected
+///
+/// The `method` label distinguishes what actually happened (drain=rejected for eth_call;
+/// drain=promoted-to-worker for trace calls). Use this counter for the Grafana gap-count
+/// dashboard instead of the deprecated `mev_degraded_gap_total`.
 #[inline]
 pub fn record_epoch_mismatch(method: &'static str, gap: Option<u64>) {
     let reason = match gap {
         None => "non_number",
-        Some(1) => "drain", // normal: in-flight drain during epoch transition
+        Some(1) => "drain", // gap=1: normal drain during epoch transition
         Some(_) => "stale", // gap ≥ 2: pipeline backup, needs immediate alert
     };
     metrics::counter!("mev_epoch_mismatch_total", "method" => method, "reason" => reason)

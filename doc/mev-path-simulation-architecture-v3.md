@@ -577,20 +577,21 @@ flowchart LR
 
 **实施内容**
 
-- `server.rs`：修改 `mev_eth_call` 降级分支，改为返回 `-39001 EpochMismatch` 错误（包含 `requestedBlock`、`currentEpoch`、`gap` 字段）
-- `server.rs`：新增 `epoch_mismatch_error()` 辅助函数
-- `metrics.rs`：新增 `record_epoch_mismatch()` 函数和 `mev_epoch_mismatch_total` 指标
-- `epoch.rs`：补充 `active_block_number()` 方法（若未暴露）
+- `server.rs`：`mev_eth_call` gap≥1 → 返回 `-39001 EpochMismatch` 错误（含 `MEV_REJECT_STALE_CALL` 回退开关）
+- `server.rs`：`mev_debug_traceCall` / `mev_trace_call` gap=1 → worker（在 N 上执行）；gap≥2 → 返回 `-39001`
+- `server.rs`：新增 `epoch_mismatch_error()` 辅助函数；移除废弃的 `DebugApiServer`/`TraceApiServer` 导入
+- `metrics.rs`：新增 `record_epoch_mismatch()` 函数和 `mev_epoch_mismatch_total` 指标（**全量 gap 事件**，包含拒绝与 promote）
+- `epoch.rs`：补充 `active_block_number()` 方法
 - 环境变量开关 `MEV_REJECT_STALE_CALL`（默认 `1`，`0` 回退 Phase 3 降级行为）
-- Grafana：新增 "Epoch Mismatch 快速拒绝" 面板
-- `mev_debug_traceCall` / `mev_trace_call` **不做任何修改**
+- Grafana：**将 "降级 Gap 分析" 面板替换为 "Gap 数量分布"**，使用 `mev_epoch_mismatch_total{method, reason}`
 
 **验收**
 
+- 所有三个接口均无降级路径（`mev_degraded_path_total` / `mev_degraded_gap_total` 为 0）
 - `mev_eth_call` 过期请求响应时间 < 1ms（无 DB 读）
-- `mev_epoch_mismatch_total{reason="stale"}` 在流量激增时不触发级联（对比 Phase 3 降级率 100% 的历史事件）
+- trace gap=1 请求进入 worker 路径，延迟与正常请求相同
+- `mev_epoch_mismatch_total{reason="stale"}` 在流量激增时不触发级联
 - Bot 侧正确处理 `-39001` 错误，不重试旧 `block_id`
-- `mev_debug_traceCall` 降级行为与 Phase 3 完全一致
 
 ---
 

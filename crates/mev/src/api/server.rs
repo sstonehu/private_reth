@@ -196,8 +196,10 @@ where
                     gap,
                 ));
             }
-            // gap == Some(1): drain — fall through to worker path.
+            // gap == Some(1): drain — record and fall through to worker path.
             // Execute on current epoch N; path simulation on latest state remains useful.
+            // Record as "drain" so the gap-count dashboard captures all non-zero gap events.
+            metrics::record_epoch_mismatch(method::DEBUG_TRACE, gap);
         }
 
         metrics::record_worker_path(method::DEBUG_TRACE, c);
@@ -265,8 +267,10 @@ where
                     gap,
                 ));
             }
-            // gap == Some(1): drain — fall through to worker path.
+            // gap == Some(1): drain — record and fall through to worker path.
             // Execute on current epoch N; path simulation on latest state remains useful.
+            // Record as "drain" so the gap-count dashboard captures all non-zero gap events.
+            metrics::record_epoch_mismatch(method::TRACE_CALL, gap);
         }
 
         metrics::record_worker_path(method::TRACE_CALL, c);

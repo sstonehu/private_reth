@@ -363,6 +363,10 @@ impl EpochManager {
                             metrics::gauge!("mev_epoch_diff_accounts_total")
                                 .set(diff_accounts);
                             metrics::gauge!("mev_epoch_diff_storage_slots_total").set(diff_slots);
+                            // Record the committed block number so Grafana tooltips can show
+                            // which block produced this diff, enabling precise event correlation.
+                            metrics::gauge!("mev_epoch_current_block_number")
+                                .set(header.number() as f64);
                         }
 
                         let _ = manager_clone.active_tx.send(epoch);

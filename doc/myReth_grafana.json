@@ -2792,7 +2792,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "stepAfter",
+            "lineInterpolation": "linear",
             "lineWidth": 2,
             "pointSize": 4,
             "scaleDistribution": {
@@ -2826,17 +2826,44 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "存储槽变更数（右轴）"
+              "options": "存储槽变更数"
             },
             "properties": [
-              {
-                "id": "custom.axisPlacement",
-                "value": "right"
-              },
               {
                 "id": "color",
                 "value": {
                   "fixedColor": "#FF9830",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "blockNumber"
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#A0A0A0",
                   "mode": "fixed"
                 }
               }
@@ -2876,7 +2903,7 @@
             "uid": "prometheus"
           },
           "expr": "reth_mev_epoch_diff_accounts_total",
-          "legendFormat": "账户变更数（左轴）",
+          "legendFormat": "账户变更数",
           "refId": "A"
         },
         {
@@ -2885,11 +2912,20 @@
             "uid": "prometheus"
           },
           "expr": "reth_mev_epoch_diff_storage_slots_total",
-          "legendFormat": "存储槽变更数（右轴）",
+          "legendFormat": "存储槽变更数",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "reth_mev_epoch_current_block_number",
+          "legendFormat": "blockNumber",
+          "refId": "C"
         }
       ],
-      "title": "每块 Diff 大小趋势（账户数左轴 / 存储槽数右轴）",
+      "title": "每块 Diff 大小趋势（账户数 / 存储槽数 · hover 可见 blockNumber）",
       "type": "timeseries"
     }
   ],

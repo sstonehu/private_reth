@@ -3,7 +3,7 @@ use crate::{
     api::types::CallKind,
     cache::GlobalSharedCache,
     epoch::EpochContext,
-    provider::CachedStateProvider,
+    provider::{CachedStateProvider, ProviderStats},
 };
 use alloy_primitives::map::HashSet;
 use crossbeam_channel::Receiver;
@@ -107,6 +107,7 @@ impl MevWorker {
             l1: &mut self.l1,
             global: self.global_cache.clone(),
             db: StateProviderDatabase::new(state_provider),
+            stats: ProviderStats::default(),
         };
 
         let mut db = State::builder().with_database(worker_provider).with_bundle_update().build();
@@ -138,7 +139,7 @@ impl MevWorker {
 
         let evm_config = self.evm_config.clone();
 
-        match &task.kind {
+        let result = match &task.kind {
             CallKind::Basic => Self::exec_basic(&evm_config, &mut db, evm_env, tx_env),
             CallKind::DebugTrace { opts } => {
                 Self::exec_debug_trace(&evm_config, &mut db, evm_env, tx_env, opts)
@@ -150,7 +151,13 @@ impl MevWorker {
                 tx_env,
                 trace_types,
             ),
-        }
+        };
+
+        // Flush task-local cache-access counters to Prometheus in a single batch.
+        // This replaces per-access atomic increments + DashMap lookups with at most 9 ops total.
+        db.database.stats.flush();
+
+        result
     }
 
     fn exec_basic(

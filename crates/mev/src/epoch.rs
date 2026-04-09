@@ -9,9 +9,11 @@ use reth_storage_api::{
 };
 use revm::primitives::hardfork::SpecId;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
+use crate::api::types::MevNewBlock;
 use crate::cache::GlobalSharedCache;
+use crate::impact::{compute_changed_raw_ids, BlockImpactRegistry};
 
 type EthEvmEnv = reth_evm::EvmEnvFor<reth_evm_ethereum::EthEvmConfig>;
 
@@ -158,6 +160,9 @@ impl StateProviderFactory for PlaceholderProviderFactory {
 pub struct EpochManager {
     active_tx: watch::Sender<Arc<EpochContext>>,
     pub active_rx: watch::Receiver<Arc<EpochContext>>,
+    /// Phase 5: 每块 block impact 广播通道（用于 mev_subscribe("newBlock")）。
+    /// 容量 64：Go 服务只有 1 个消费者，极少积压；节点重启期间旧订阅会断连重连。
+    impact_tx: broadcast::Sender<Arc<MevNewBlock>>,
     debug_fixed_block: Option<BlockNumber>,
     /// Whether Phase 3 diff-based cache invalidation is active.
     /// Set MEV_DIFF_CACHE=0 to fall back to Phase 2 full invalidation.
@@ -171,6 +176,7 @@ impl std::fmt::Debug for EpochManager {
             .field("diff_cache_enabled", &self.diff_cache_enabled)
             .field("current_block_number", &self.active_rx.borrow().block_number)
             .field("debug_fixed_block", &self.debug_fixed_block)
+            .field("impact_subscribers", &self.impact_tx.receiver_count())
             .finish_non_exhaustive()
     }
 }
@@ -248,7 +254,20 @@ impl EpochManager {
         let initial = Arc::new(EpochContext::placeholder());
         let (active_tx, active_rx) = watch::channel(initial);
 
-        let manager = Arc::new(Self { active_tx, active_rx, debug_fixed_block, diff_cache_enabled });
+        // Phase 5: block impact broadcast channel
+        // 容量 64：足以吸收 Go 服务处理 1 个 block 期间可能到来的新块（实际上只有 1 个订阅者）
+        let (impact_tx, _impact_rx_placeholder) = broadcast::channel::<Arc<MevNewBlock>>(64);
+
+        // 构建 block impact handler 注册表（从环境变量加载共享合约地址）
+        let impact_registry = BlockImpactRegistry::from_env();
+
+        let manager = Arc::new(Self {
+            active_tx,
+            active_rx,
+            impact_tx,
+            debug_fixed_block,
+            diff_cache_enabled,
+        });
         let manager_clone = Arc::clone(&manager);
         let fixed_block = debug_fixed_block;
         let diff_cache = diff_cache_enabled;
@@ -371,6 +390,21 @@ impl EpochManager {
 
                         let _ = manager_clone.active_tx.send(epoch);
 
+                        // ── Phase 5: 计算 block impact 并广播给 mev_subscribe 订阅者 ──
+                        // 若无订阅者（receiver_count == 0），send 立即返回 Err，安全忽略。
+                        if manager_clone.impact_tx.receiver_count() > 0 {
+                            let changed_raw_ids =
+                                compute_changed_raw_ids(&notification, &impact_registry);
+                            let mev_block = Arc::new(MevNewBlock {
+                                block_number: header.number(),
+                                block_hash: format!("{:#x}", tip.hash()),
+                                timestamp: header.timestamp(),
+                                base_fee_per_gas: header.base_fee_per_gas(),
+                                changed_raw_ids,
+                            });
+                            let _ = manager_clone.impact_tx.send(mev_block);
+                        }
+
                         // ── t1: epoch published, MEV workers can now serve ──
                         // Segment 2: EpochManager processing delay.
                         // = build_block_env + build_epoch + on_epoch_change_diff + pre_fill_diff.
@@ -423,6 +457,15 @@ impl EpochManager {
     /// 获取当前活跃 epoch 快照（Arc 零拷贝）。
     pub fn current(&self) -> Arc<EpochContext> {
         self.active_rx.borrow().clone()
+    }
+
+    /// 订阅每块 block impact 数据（用于 `mev_subscribe("newBlock")`）。
+    ///
+    /// 每个调用返回一个独立的 `broadcast::Receiver`，容量 64。
+    /// 若接收端消费过慢导致 channel 满，旧消息被丢弃（lagged error），
+    /// 订阅者应断开重连——Go 服务重连后会重新拿最新 epoch。
+    pub fn subscribe_impact(&self) -> broadcast::Receiver<Arc<MevNewBlock>> {
+        self.impact_tx.subscribe()
     }
 
     /// 判断请求 block_id 是否与 active epoch 匹配。

@@ -17,6 +17,7 @@
 pub mod api;
 pub mod cache;
 pub mod epoch;
+pub mod impact;
 pub mod metrics;
 pub mod provider;
 pub mod worker;

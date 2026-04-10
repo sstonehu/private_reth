@@ -48,13 +48,19 @@ pub trait MevApi {
     ///
     /// - 订阅方法：`mev_subscribe`（与 go-ethereum `rpc.Client.Subscribe(ctx, "mev", ch)` 兼容）
     /// - 退订方法：`mev_unsubscribe`
-    /// - 推送通知：`mev_subscription`
+    /// - 推送通知：`mev_subscription`（jsonrpsee 通知方法名 = namespace + primary name）
     /// - 推送类型：[`MevNewBlock`]
     ///
     /// Go 侧替换 `eth_subscribe("newHeads")` + `eth_getLogs`，直接消费此订阅：
     ///   `rpcClient.Subscribe(ctx, "mev", ch)`
+    ///
+    /// # 命名说明
+    /// go-ethereum `rpc.Client` 硬编码规则：订阅调用 `{ns}_subscribe`，监听通知 `{ns}_subscription`。
+    /// jsonrpsee 通知方法名 = `{namespace}_{name}`（primary name，非 alias）。
+    /// 因此 primary name 必须为 `"subscription"`，`"subscribe"` 作为 alias 接受订阅请求。
     #[subscription(
-        name = "subscribe",
+        name = "subscription",
+        aliases = ["subscribe"],
         unsubscribe = "unsubscribe",
         item = MevNewBlock
     )]

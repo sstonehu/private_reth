@@ -9,9 +9,6 @@ use alloy_rpc_types_trace::{
 };
 use jsonrpsee::proc_macros::rpc;
 
-#[allow(unused_imports)]
-use crate::api::types::MevNewBlock;
-
 #[rpc(server, namespace = "mev")]
 pub trait MevApi {
     /// 等价于 `eth_call`，执行路径走 worker pool。
@@ -43,26 +40,7 @@ pub trait MevApi {
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> jsonrpsee::core::RpcResult<TraceResults>;
-
-    /// 订阅每个新块的 block impact 数据（`changed_raw_ids`）。
-    ///
-    /// - 订阅方法：`mev_subscribe`（与 go-ethereum `rpc.Client.Subscribe(ctx, "mev", ch)` 兼容）
-    /// - 退订方法：`mev_unsubscribe`
-    /// - 推送通知：`mev_subscription`（jsonrpsee 通知方法名 = namespace + primary name）
-    /// - 推送类型：[`MevNewBlock`]
-    ///
-    /// Go 侧替换 `eth_subscribe("newHeads")` + `eth_getLogs`，直接消费此订阅：
-    ///   `rpcClient.Subscribe(ctx, "mev", ch)`
-    ///
-    /// # 命名说明
-    /// go-ethereum `rpc.Client` 硬编码规则：订阅调用 `{ns}_subscribe`，监听通知 `{ns}_subscription`。
-    /// jsonrpsee 通知方法名 = `{namespace}_{name}`（primary name，非 alias）。
-    /// 因此 primary name 必须为 `"subscription"`，`"subscribe"` 作为 alias 接受订阅请求。
-    #[subscription(
-        name = "subscription",
-        aliases = ["subscribe"],
-        unsubscribe = "unsubscribe",
-        item = MevNewBlock
-    )]
-    async fn subscribe_new_block(&self) -> jsonrpsee::core::SubscriptionResult;
+    // mev_subscribe 订阅通过 lib.rs 中的 register_subscription 手动注册，
+    // 以实现订阅方法名（mev_subscribe）与通知方法名（mev_subscription）分离，
+    // 兼容 go-ethereum rpc.Client.Subscribe 的 {ns}_subscription 通知约定。
 }

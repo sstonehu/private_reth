@@ -11,7 +11,7 @@ use alloy_rpc_types_trace::{
     geth::{GethDebugTracingCallOptions, GethTrace},
     parity::{TraceResults, TraceType},
 };
-use jsonrpsee::{core::RpcResult, PendingSubscriptionSink, SubscriptionMessage};
+use jsonrpsee::core::RpcResult;
 use reth_rpc_convert::{RpcConvert, RpcTypes};
 use reth_rpc_eth_api::{
     helpers::{EthCall, EthTransactions, TraceExt},
@@ -308,56 +308,6 @@ where
         result
     }
 
-    async fn subscribe_new_block(
-        &self,
-        pending: PendingSubscriptionSink,
-    ) -> jsonrpsee::core::SubscriptionResult {
-        let sink = pending.accept().await?;
-        let mut rx = self.epoch_manager.subscribe_impact();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = sink.closed() => break,
-                    result = rx.recv() => {
-                        match result {
-                            Ok(block) => {
-                                let msg = match SubscriptionMessage::new(
-                                    sink.method_name(),
-                                    sink.subscription_id(),
-                                    block.as_ref(),
-                                ) {
-                                    Ok(msg) => msg,
-                                    Err(err) => {
-                                        tracing::error!(
-                                            target: "reth::mev::impact",
-                                            %err,
-                                            "failed to serialize MevNewBlock"
-                                        );
-                                        break;
-                                    }
-                                };
-                                if sink.send(msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                // 消费过慢；跳过旧消息，继续推最新数据
-                                tracing::warn!(
-                                    target: "reth::mev::impact",
-                                    skipped = n,
-                                    "mev_subscribeNewBlock: subscriber lagged"
-                                );
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(())
-    }
 }
 
 

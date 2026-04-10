@@ -27,11 +27,13 @@ use crate::{
         server::{MevApiServer as MevServer, MevCallConfig},
         MevApiServer as _,
     },
+    api::types::MevNewBlock,
     cache::GlobalSharedCache,
     epoch::EpochManager,
     metrics::MevCounters,
     worker::{MevWorkerPool, DEFAULT_POOL_SIZE},
 };
+use jsonrpsee::SubscriptionMessage;
 use reth_node_api::{BlockTy, FullNodeComponents, HeaderTy, NodeTypes, ReceiptTy, TxTy};
 use reth_node_builder::rpc::RpcContext;
 use reth_rpc_convert::{RpcConvert, RpcTypes};
@@ -39,6 +41,7 @@ use reth_rpc_eth_api::{
     helpers::{Call, EthCall, EthTransactions, TraceExt},
     EthApiTypes, RpcNodeCore,
 };
+use tokio::sync::broadcast::error::RecvError;
 
 pub use crate::worker::DEFAULT_POOL_SIZE as DEFAULT_MEV_POOL_SIZE;
 pub use epoch::EpochContext;
@@ -126,7 +129,10 @@ where
         std::time::Duration::from_secs(stats_interval_secs),
     );
 
-    let mev_module = MevServer {
+    // 在移入 MevServer 之前先 clone，供 mev_subscribe 订阅闭包使用
+    let epoch_manager_for_sub = epoch_manager.clone();
+
+    let mut mev_module = MevServer {
         epoch_manager,
         worker_pool,
         call_config,
@@ -137,6 +143,92 @@ where
         reject_stale_call,
     }
     .into_rpc();
+
+    // ── mev_subscribe / mev_subscription ────────────────────────────────────
+    // 使用低级 register_subscription API，分别指定：
+    //   订阅方法名 = "mev_subscribe"   （go-ethereum 发送此方法）
+    //   通知方法名 = "mev_subscription"（go-ethereum 监听此方法，硬编码 {ns}_subscription）
+    // 与 eth_subscribe / eth_subscription 的约定完全一致。
+    //
+    // 参数：第一个字符串参数为订阅类型，当前支持 "newBlockRawIds"（返回 MevNewBlock）。
+    // 未来可扩展 "newBlockLogs" 等类型，无需新增 RPC 方法。
+    {
+        let em = epoch_manager_for_sub;
+        mev_module
+            .register_subscription(
+                "mev_subscribe",
+                "mev_subscription",
+                "mev_unsubscribe",
+                move |params, pending, _ctx| {
+                    let em = em.clone();
+                    async move {
+                        let kind: String =
+                            params.one().unwrap_or_default();
+                        match kind.as_str() {
+                            "newBlockRawIds" => {
+                                let mut rx = em.subscribe_impact();
+                                let sink = match pending.accept().await {
+                                    Ok(s) => s,
+                                    Err(_) => return, // 客户端在 accept 前已断开
+                                };
+                                tokio::spawn(async move {
+                                    loop {
+                                        tokio::select! {
+                                            _ = sink.closed() => break,
+                                            result = rx.recv() => {
+                                                match result {
+                                                    Ok(block) => {
+                                                        let msg = match SubscriptionMessage::new(
+                                                            sink.method_name(),
+                                                            sink.subscription_id(),
+                                                            block.as_ref() as &MevNewBlock,
+                                                        ) {
+                                                            Ok(m) => m,
+                                                            Err(e) => {
+                                                                tracing::error!(
+                                                                    target: "reth::mev::impact",
+                                                                    %e,
+                                                                    "mev_subscribe: serialize MevNewBlock failed"
+                                                                );
+                                                                break;
+                                                            }
+                                                        };
+                                                        if sink.send(msg).await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(RecvError::Lagged(n)) => {
+                                                        tracing::warn!(
+                                                            target: "reth::mev::impact",
+                                                            skipped = n,
+                                                            "mev_subscribe(newBlockRawIds): subscriber lagged"
+                                                        );
+                                                    }
+                                                    Err(RecvError::Closed) => break,
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            _ => {
+                                pending
+                                    .reject(jsonrpsee::types::ErrorObject::owned(
+                                        -32602,
+                                        format!(
+                                            "unknown mev subscription kind: \"{kind}\". supported: \"newBlockRawIds\""
+                                        ),
+                                        None::<()>,
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                },
+            )
+            .map_err(|e| eyre::eyre!("register mev_subscribe: {e}"))?;
+    }
+
     ctx.modules.merge_configured(mev_module)?;
 
     tracing::info!(

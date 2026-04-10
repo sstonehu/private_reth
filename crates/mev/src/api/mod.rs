@@ -46,14 +46,16 @@ pub trait MevApi {
 
     /// 订阅每个新块的 block impact 数据（`changed_raw_ids`）。
     ///
-    /// - 订阅方法：`mev_subscribeNewBlock`
-    /// - 退订方法：`mev_unsubscribeNewBlock`
+    /// - 订阅方法：`mev_subscribe`（与 go-ethereum `rpc.Client.Subscribe(ctx, "mev", ch)` 兼容）
+    /// - 退订方法：`mev_unsubscribe`
+    /// - 推送通知：`mev_subscription`
     /// - 推送类型：[`MevNewBlock`]
     ///
-    /// Go 侧替换 `eth_subscribe("newHeads")` + `eth_getLogs`，直接消费此订阅。
+    /// Go 侧替换 `eth_subscribe("newHeads")` + `eth_getLogs`，直接消费此订阅：
+    ///   `rpcClient.Subscribe(ctx, "mev", ch)`
     #[subscription(
-        name = "subscribeNewBlock",
-        unsubscribe = "unsubscribeNewBlock",
+        name = "subscribe",
+        unsubscribe = "unsubscribe",
         item = MevNewBlock
     )]
     async fn subscribe_new_block(&self) -> jsonrpsee::core::SubscriptionResult;

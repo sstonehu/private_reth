@@ -62,7 +62,7 @@ impl ImpactLogHandler for BalancerV2Handler {
             return;
         }
         let pool_addr = Address::from_slice(&log.topics()[1].as_slice()[0..20]);
-        changed.insert(format!("{pool_addr:#x}"));
+        changed.insert(pool_addr.to_checksum(None));
     }
 }
 
@@ -79,7 +79,7 @@ impl ImpactLogHandler for BalancerV3Handler {
             return;
         }
         let pool_addr = Address::from_slice(&log.topics()[1].as_slice()[12..32]);
-        changed.insert(format!("{pool_addr:#x}"));
+        changed.insert(pool_addr.to_checksum(None));
     }
 }
 
@@ -277,9 +277,10 @@ pub fn compute_changed_raw_ids(
     // ── S1：全量 state diff ───────────────────────────────────────────────
     // 所有有 storage/nonce/balance 变化的合约地址直接写入。
     // 包含：per-pool 合约（S1-A/B/C）、共享合约（S1-D）、hook 合约（S2-B/C 补充）。
+    // 地址使用 EIP-55 checksum 格式，与 Go 侧 NormalizeAddress 输出一致。
     // pricer 侧 pool.rawIds 中若有对应地址则命中，否则安全忽略。
     for (addr, _) in outcome.bundle_accounts_iter() {
-        changed.insert(format!("{addr:#x}"));
+        changed.insert(addr.to_checksum(None));
     }
 
     // ── S2/S3：receipts logs ──────────────────────────────────────────────

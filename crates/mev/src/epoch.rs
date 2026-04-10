@@ -1,5 +1,5 @@
 use alloy_consensus::BlockHeader;
-use alloy_eips::{BlockId, BlockNumHash, BlockNumberOrTag};
+use alloy_eips::{eip1559::BaseFeeParams, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{BlockHash, BlockNumber, B256};
 use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_chainspec::ChainInfo;
@@ -400,6 +400,8 @@ impl EpochManager {
                                 block_hash: format!("{:#x}", tip.hash()),
                                 timestamp: header.timestamp(),
                                 base_fee_per_gas: header.base_fee_per_gas(),
+                                next_base_fee_per_gas: header
+                                    .next_block_base_fee(BaseFeeParams::ethereum()),
                                 changed_raw_ids,
                             });
                             let _ = manager_clone.impact_tx.send(mev_block);

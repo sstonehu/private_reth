@@ -29,8 +29,12 @@ pub struct MevNewBlock {
     pub block_hash: String,
     /// Unix 秒级时间戳。
     pub timestamp: u64,
-    /// EIP-1559 base fee（单位 wei），pre-London 块为 null。
+    /// EIP-1559 当前块 base fee（单位 wei），pre-London 块为 null。
     pub base_fee_per_gas: Option<u64>,
+    /// 下一块预测 base fee（单位 wei）。
+    /// 由 reth 按 EIP-1559 公式 calc_next_block_base_fee(gas_used, gas_limit, base_fee) 计算，
+    /// 精度与链上一致，Go 侧无需再估算。
+    pub next_base_fee_per_gas: Option<u64>,
     /// 本 block 中可能有价格变化的 raw pool 标识列表。
     pub changed_raw_ids: Vec<String>,
 }

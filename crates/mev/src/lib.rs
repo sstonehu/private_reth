@@ -33,7 +33,7 @@ use crate::{
     metrics::MevCounters,
     worker::{MevWorkerPool, DEFAULT_POOL_SIZE},
 };
-use jsonrpsee::SubscriptionMessage;
+use jsonrpsee::{Extensions, SubscriptionMessage};
 use reth_node_api::{BlockTy, FullNodeComponents, HeaderTy, NodeTypes, ReceiptTy, TxTy};
 use reth_node_builder::rpc::RpcContext;
 use reth_rpc_convert::{RpcConvert, RpcTypes};
@@ -159,7 +159,7 @@ where
                 "mev_subscribe",
                 "mev_subscription",
                 "mev_unsubscribe",
-                move |params, pending, _ctx| {
+                move |params, pending, _ctx, _ext: Extensions| {
                     let em = em.clone();
                     async move {
                         let kind: String =
@@ -181,7 +181,7 @@ where
                                                         let msg = match SubscriptionMessage::new(
                                                             sink.method_name(),
                                                             sink.subscription_id(),
-                                                            block.as_ref() as &MevNewBlock,
+                                                            &*block,
                                                         ) {
                                                             Ok(m) => m,
                                                             Err(e) => {

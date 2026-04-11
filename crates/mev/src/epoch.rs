@@ -258,8 +258,8 @@ impl EpochManager {
         // 容量 64：足以吸收 Go 服务处理 1 个 block 期间可能到来的新块（实际上只有 1 个订阅者）
         let (impact_tx, _impact_rx_placeholder) = broadcast::channel::<Arc<MevNewBlock>>(64);
 
-        // 构建 block impact handler 注册表（从环境变量加载共享合约地址）
-        let impact_registry = BlockImpactRegistry::from_env();
+        // 构建 block impact handler 注册表（使用代码内置主网共享合约地址）
+        let impact_registry = BlockImpactRegistry::mainnet_defaults();
 
         let manager = Arc::new(Self {
             active_tx,
@@ -391,10 +391,10 @@ impl EpochManager {
                         let _ = manager_clone.active_tx.send(epoch);
 
                         // ── Phase 5: 计算 block impact 并广播给 mev_subscribe 订阅者 ──
-                        // 若无订阅者（receiver_count == 0），send 立即返回 Err，安全忽略。
+                        let changed_raw_ids =
+                            compute_changed_raw_ids(&notification, &impact_registry);
+
                         if manager_clone.impact_tx.receiver_count() > 0 {
-                            let changed_raw_ids =
-                                compute_changed_raw_ids(&notification, &impact_registry);
                             let mev_block = Arc::new(MevNewBlock {
                                 block_number: header.number(),
                                 block_hash: format!("{:#x}", tip.hash()),

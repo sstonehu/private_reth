@@ -12,7 +12,7 @@
 //!
 //! | 内容 | 来源 |
 //! |------|------|
-//! | S2/S3 共享合约地址（MEV_* 环境变量）| 合约升级时更新 |
+//! | S2/S3 共享合约地址（代码内置常量）| 合约升级时更新 |
 //! | FluidDexLite `LogSwap` topic0（1 个常量，代码内嵌）| ABI 变更时更新 |
 
 use alloy_primitives::{address, Address, B256};
@@ -23,9 +23,19 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-// ── BalancerV2 Vault 已知主网地址（可通过 MEV_BALANCER_V2_VAULT 覆盖） ────────
-const BALANCER_V2_VAULT_DEFAULT: Address =
+// ── 共享合约主网常量地址 ──────────────────────────────────────────────────────
+const BALANCER_V2_VAULT: Address =
     address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+const BALANCER_V3_VAULT: Address =
+    address!("bA1333333333a1BA1108E8412f11850A5C319bA9");
+const UNISWAP_V4_POOL_MANAGER: Address =
+    address!("000000000004444c5dc75cB358380D2e3dE08A90");
+const FLUID_DEX_LITE: Address =
+    address!("bBCB91440523216E2b87052A99F69c604A7B6e00");
+const CORE_SWAP_POOL_MANAGER: Address =
+    address!("e0e0e08A6A4B9dc7Bd67bCB7AAde5cf48157D444");
+const CORE_SWAP_V3_POOL_MANAGER: Address =
+    address!("00000000000014AA86C5d3C41765bb24E11bD701");
 
 // ── FluidDexLite LogSwap topic0（唯一内嵌常量，区分两种 data 布局） ─────────────
 static FLUID_LOG_SWAP_TOPIC0: OnceLock<B256> = OnceLock::new();
@@ -187,58 +197,34 @@ impl std::fmt::Debug for BlockImpactRegistry {
 }
 
 impl BlockImpactRegistry {
-    /// 从环境变量构建注册表。
-    ///
-    /// 环境变量说明：
-    /// - `MEV_BALANCER_V2_VAULT`         Balancer V2 Vault（默认主网地址）
-    /// - `MEV_BALANCER_V3_VAULT`         Balancer V3 Vault
-    /// - `MEV_UNISWAP_V4_POOL_MANAGER`   UniswapV4 PoolManager
-    /// - `MEV_FLUID_DEX_LITE`            FluidDexLite 共享合约
-    /// - `MEV_CORE_SWAP_POOL_MANAGER`    coreSwap PoolManager
-    /// - `MEV_CORE_SWAP_V3_POOL_MANAGER` coreSwapV3 PoolManager
-    pub fn from_env() -> Arc<Self> {
+    /// 使用代码内置的共享合约主网地址构建注册表。
+    pub fn mainnet_defaults() -> Arc<Self> {
         let mut handlers: HashMap<Address, Box<dyn ImpactLogHandler>> = HashMap::new();
 
-        // BalancerV2：有已知主网默认地址
-        let v2_vault = std::env::var("MEV_BALANCER_V2_VAULT")
-            .ok()
-            .and_then(|s| s.parse::<Address>().ok())
-            .unwrap_or(BALANCER_V2_VAULT_DEFAULT);
-        handlers.insert(v2_vault, Box::new(BalancerV2Handler));
-        tracing::info!(target: "reth::mev::impact", addr = ?v2_vault, "registered BalancerV2Handler");
-
-        // 其余合约仅在环境变量配置时注册
-        macro_rules! register_if_set {
-            ($env_key:literal, $handler:expr, $name:literal) => {
-                if let Some(addr) = std::env::var($env_key)
-                    .ok()
-                    .and_then(|s| s.parse::<Address>().ok())
-                {
-                    handlers.insert(addr, Box::new($handler));
-                    tracing::info!(
-                        target: "reth::mev::impact",
-                        addr = ?addr,
-                        handler = $name,
-                        "registered impact handler"
-                    );
-                }
-            };
+        macro_rules! register_handler {
+            ($addr:expr, $handler:expr, $name:literal) => {{
+                let addr = $addr;
+                handlers.insert(addr, Box::new($handler));
+                tracing::info!(
+                    target: "reth::mev::impact",
+                    addr = ?addr,
+                    handler = $name,
+                    "registered impact handler"
+                );
+            }};
         }
 
-        register_if_set!("MEV_BALANCER_V3_VAULT", BalancerV3Handler, "BalancerV3Handler");
-        register_if_set!(
-            "MEV_UNISWAP_V4_POOL_MANAGER",
-            UniswapV4Handler,
-            "UniswapV4Handler"
-        );
-        register_if_set!("MEV_FLUID_DEX_LITE", FluidDexLiteHandler, "FluidDexLiteHandler");
-        register_if_set!(
-            "MEV_CORE_SWAP_POOL_MANAGER",
+        register_handler!(BALANCER_V2_VAULT, BalancerV2Handler, "BalancerV2Handler");
+        register_handler!(BALANCER_V3_VAULT, BalancerV3Handler, "BalancerV3Handler");
+        register_handler!(UNISWAP_V4_POOL_MANAGER, UniswapV4Handler, "UniswapV4Handler");
+        register_handler!(FLUID_DEX_LITE, FluidDexLiteHandler, "FluidDexLiteHandler");
+        register_handler!(
+            CORE_SWAP_POOL_MANAGER,
             CoreSwapHandler,
             "CoreSwapHandler(coreSwap)"
         );
-        register_if_set!(
-            "MEV_CORE_SWAP_V3_POOL_MANAGER",
+        register_handler!(
+            CORE_SWAP_V3_POOL_MANAGER,
             CoreSwapHandler,
             "CoreSwapHandler(coreSwapV3)"
         );

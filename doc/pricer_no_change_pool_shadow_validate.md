@@ -337,7 +337,7 @@ Shadow Validate 需要在固定块高上做真实询价，因此对 `private_ret
 - `mev_eth_call` 的 stale 请求会直接返回 `-39001`
 - 无法完成“旧缓存 vs fresh quote”的对照验证
 
-> 注：当前该开关只影响 `mev_eth_call`；`mev_debug_traceCall` 与 `mev_trace_call` 仍按自身 stale 规则执行。
+> 注：当前该开关已影响三个接口；关闭时会分别回退到原生 `eth_call` / `debug_traceCall` / `trace_call` 路径。
 
 ---
 

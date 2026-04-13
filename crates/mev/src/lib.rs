@@ -7,7 +7,7 @@
 //! - Phase 1: EVM Worker Pool + mev_* 单笔接口
 //! - Phase 2: GlobalSharedCache 全局读缓存
 //! - Phase 3: 精确 Diff 缓存失效（`MEV_DIFF_CACHE`）
-//! - Phase 4: mev_eth_call 过期请求快速拒绝（`MEV_REJECT_STALE_CALL`）
+//! - Phase 4: 所有 mev_* 接口的过期请求按开关切换 Phase 4 规则（`MEV_REJECT_STALE_CALL`）
 //!
 //! 使用 [`install_mev_rpc`] 将模块挂载到 Reth 的 `extend_rpc_modules` 钩子。
 #![allow(missing_docs)]
@@ -27,7 +27,6 @@ use crate::{
         server::{MevApiServer as MevServer, MevCallConfig},
         MevApiServer as _,
     },
-    api::types::MevNewBlock,
     cache::GlobalSharedCache,
     epoch::EpochManager,
     metrics::MevCounters,
@@ -119,8 +118,8 @@ where
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
-    // MEV_REJECT_STALE_CALL=0 falls back to Phase 3 degradation for mev_eth_call.
-    // All other values (including unset) enable Phase 4 fast rejection.
+    // MEV_REJECT_STALE_CALL=0 falls back to Phase 3 native degradation for all mev_* calls.
+    // All other values (including unset) enable Phase 4 stale handling rules.
     let reject_stale_call =
         std::env::var("MEV_REJECT_STALE_CALL").map(|v| v != "0").unwrap_or(true);
     metrics::spawn_periodic_reporter(
@@ -238,7 +237,7 @@ where
         call_gas_cap = call_config.call_gas_cap,
         stats_interval_secs,
         reject_stale_call,
-        "mev RPC module installed (Phase 4: eth_call fast rejection enabled)"
+        "mev RPC module installed (Phase 4 stale-call handling configured)"
     );
 
     Ok(())

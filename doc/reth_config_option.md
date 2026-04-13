@@ -19,7 +19,7 @@
 | `MEV_STATS_INTERVAL_SECS` | `30` | Phase 2 | 周期性统计日志输出间隔（秒） | 设为 `0` 无效，最小生效值为 `1` |
 | `MEV_DEBUG_FIXED_EPOCH` | 未设置 | Phase 2 | 冻结 EpochManager 在指定块高 | 仅调试可用，禁止生产启用 |
 | `MEV_DIFF_CACHE` | `1`（启用） | Phase 3 | 控制是否启用 diff cache 精确失效 | `0` 回退到 Phase 2 的全量失效 |
-| `MEV_REJECT_STALE_CALL` | `1`（启用） | Phase 4 | 控制 `mev_eth_call` 是否快速拒绝旧 epoch 请求 | `0` 回退到 Phase 3 的 degrade 行为 |
+| `MEV_REJECT_STALE_CALL` | `1`（启用） | Phase 4 | 控制三个 `mev_*` 接口遇到旧 epoch 请求时是否启用 Phase 4 stale 规则 | `0` 回退到 Phase 3 的 degrade 行为 |
 
 ## 各配置项详情
 
@@ -82,10 +82,12 @@ MEV_DEBUG_FIXED_EPOCH=21000000 reth node --http --http.api eth,debug,trace,mev
 
 - 默认值：`1`
 - 引入阶段：Phase 4
-- 作用：控制 `mev_eth_call` 遇到旧 epoch 请求时，是快速拒绝还是回退 degrade
+- 作用：控制三个 `mev_*` 接口遇到旧 epoch 请求时，是按 Phase 4 stale 规则处理，还是回退 degrade
 - 配置语义：
-  - `1`：Phase 4 生效，旧请求返回 `-39001`
-  - `0`：回退到 Phase 3 的原生 `eth_call` degrade 路径
+  - `1`：Phase 4 生效
+  - `mev_eth_call`：旧请求返回 `-39001`
+  - `mev_debug_traceCall` / `mev_trace_call`：`gap=1` 走 worker，`gap>=2` 返回 `-39001`
+  - `0`：回退到 Phase 3 的原生 `eth_call` / `debug_traceCall` / `trace_call` degrade 路径
 - 典型用途：Bot 适配 `-39001` 前先灰度关闭；适配完成后再开启
 
 ## 文档中提到的固定内部参数

@@ -366,7 +366,7 @@ Step 4（清理，稳定运行数天后）
 
 | 变量名 | 默认值 | 作用 | 备注 |
 |--------|--------|------|------|
-| `MEV_REJECT_STALE_CALL` | `1`（启用）| **灰度开关**：`1`（或未设置）= Phase 4 启用，`mev_eth_call` 过期请求返回 `-39001` 快速错误；`0` = 回退 Phase 3 降级行为（走原生 `eth_call`） | Bot 侧适配完成前建议先设 `0` 灰度，确认后切 `1` |
+| `MEV_REJECT_STALE_CALL` | `1`（启用）| **灰度开关**：`1`（或未设置）= Phase 4 启用，三个接口都按 Phase 4 stale 规则处理；`0` = 回退 Phase 3 降级行为（分别走原生 `eth_call` / `debug_traceCall` / `trace_call`） | Bot 侧适配完成前建议先设 `0` 灰度，确认后切 `1` |
 
 **快速灰度配置**：
 
@@ -438,13 +438,12 @@ Bot 上线 Phase 4 前需满足以下条件：
 
 ### 11.2 功能落地结果
 
-1. `mev_eth_call` 的过期请求处理已改为 **快速拒绝**（默认开启）：
-   - 条件：`!matches_active(block_id)`
-   - 行为：立即返回 `-39001` EpochMismatch，不走原生 `eth_call`，不触发 DB 读取与 EVM 执行
+1. `MEV_REJECT_STALE_CALL` 已接入三个接口的 stale 分支：
+   - `mev_eth_call`：开关开启时 `gap >= 1` 立即返回 `-39001`
+   - `mev_debug_traceCall` / `mev_trace_call`：开关开启时 `gap = 1` 走 worker，`gap >= 2` 返回 `-39001`
 2. 保留 Phase 3 回退路径：
-   - `MEV_REJECT_STALE_CALL=0` 时仍走原生 `eth_call` 降级逻辑
-3. `mev_debug_traceCall` / `mev_trace_call` 的降级逻辑保持不变（仅沿用原有 degraded 路径与指标）
-4. 新增并接入 `reject_stale_call` 配置：
+   - `MEV_REJECT_STALE_CALL=0` 时，三个接口都回退到各自原生 RPC 降级逻辑
+3. 新增并接入 `reject_stale_call` 配置：
    - 读取环境变量：`MEV_REJECT_STALE_CALL`
    - 注入 `MevApiServer` 字段并进入 `Debug` 输出
    - 启动日志增加 `reject_stale_call` 字段，文案更新为 Phase 4
@@ -658,8 +657,8 @@ fn epoch_mismatch_error(
 在 `stats_interval_secs` 读取之后、`MevServer { ... }` 构造之前，添加：
 
 ```rust
-// MEV_REJECT_STALE_CALL=0 falls back to Phase 3 degradation for mev_eth_call.
-// All other values (including unset) enable Phase 4 fast rejection.
+// MEV_REJECT_STALE_CALL=0 falls back to Phase 3 degradation for all mev_* calls.
+// All other values (including unset) enable Phase 4 stale handling rules.
 let reject_stale_call =
     std::env::var("MEV_REJECT_STALE_CALL").map(|v| v != "0").unwrap_or(true);
 ```
@@ -725,9 +724,9 @@ tracing::info!(
 
 - `cargo check -p reth-mev`：零错误零警告
 - `cargo nextest run -p reth-mev`：全部通过
-- `MEV_REJECT_STALE_CALL=1`（默认）时：过期 `mev_eth_call` 请求立即返回 `-39001` 错误，
-  响应体包含 `requestedBlock`、`currentEpoch`、`gap` 字段
-- `MEV_REJECT_STALE_CALL=0` 时：行为与 Phase 3 完全一致（降级走原生 eth_call）
-- `mev_debug_traceCall` 和 `mev_trace_call` 的行为与改动前完全一致
+- `MEV_REJECT_STALE_CALL=1`（默认）时：
+  - `mev_eth_call` 的过期请求立即返回 `-39001`
+  - `mev_debug_traceCall` / `mev_trace_call` 的 `gap=1` 请求继续走 worker，`gap>=2` 返回 `-39001`
+- `MEV_REJECT_STALE_CALL=0` 时：三个接口行为都与 Phase 3 完全一致（分别降级走原生 `eth_call` / `debug_traceCall` / `trace_call`）
 - 启动日志中出现 `reject_stale_call=true/false`
 ````

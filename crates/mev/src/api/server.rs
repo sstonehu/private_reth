@@ -10,6 +10,7 @@ use alloy_rpc_types_eth::{state::StateOverride, BlockId, BlockOverrides, Transac
 use alloy_rpc_types_trace::{
     geth::{GethDebugTracingCallOptions, GethTrace},
     parity::{TraceResults, TraceType},
+    tracerequest::TraceCallRequest,
 };
 use jsonrpsee::core::RpcResult;
 use reth_rpc_convert::{RpcConvert, RpcTypes};
@@ -36,8 +37,9 @@ pub struct MevApiServer<EthApi: RpcNodeCore<Evm = reth_evm_ethereum::EthEvmConfi
     pub eth_api: EthApi,
     pub debug_api: reth_rpc::DebugApi<EthApi>,
     pub trace_api: reth_rpc::TraceApi<EthApi>,
-    /// Phase 4: if true, mev_eth_call with stale block_id returns -39001 immediately
-    /// instead of degrading to the native eth_call path.
+    /// Phase 4 switch for stale block_id handling on all mev_* call endpoints.
+    /// When enabled, stale requests follow the Phase 4 fast-reject / drain rules;
+    /// when disabled, requests fall back to the corresponding native RPC path.
     /// Controlled by MEV_REJECT_STALE_CALL env var (default: true).
     pub reject_stale_call: bool,
 }
@@ -186,6 +188,17 @@ where
 
         if !self.epoch_manager.matches_active(block_id) {
             let gap = self.epoch_manager.block_gap(block_id);
+            if !self.reject_stale_call {
+                metrics::record_degraded_path(method::DEBUG_TRACE, c);
+                metrics::record_degraded_gap(method::DEBUG_TRACE, gap);
+                let result = self
+                    .debug_api
+                    .debug_trace_call(request, block_id, opts.unwrap_or_default())
+                    .await
+                    .map_err(Into::into);
+                metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
+                return result;
+            }
             if gap != Some(1) {
                 // gap >= 2 or non-number block_id: fast rejection.
                 metrics::record_epoch_mismatch(method::DEBUG_TRACE, gap);
@@ -257,6 +270,23 @@ where
 
         if !self.epoch_manager.matches_active(block_id) {
             let gap = self.epoch_manager.block_gap(block_id);
+            if !self.reject_stale_call {
+                metrics::record_degraded_path(method::TRACE_CALL, c);
+                metrics::record_degraded_gap(method::TRACE_CALL, gap);
+                let result = self
+                    .trace_api
+                    .trace_call(TraceCallRequest {
+                        call: request,
+                        trace_types,
+                        block_id,
+                        state_overrides,
+                        block_overrides,
+                    })
+                    .await
+                    .map_err(Into::into);
+                metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
+                return result;
+            }
             if gap != Some(1) {
                 // gap >= 2 or non-number block_id: fast rejection.
                 metrics::record_epoch_mismatch(method::TRACE_CALL, gap);

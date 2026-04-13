@@ -653,7 +653,7 @@ MEV 的读取模式：整个 epoch（12s）内 60 workers 持续并发读
 | `MEV_STATS_INTERVAL_SECS` | `30` | 周期性 `tracing::info` 统计日志的输出间隔（秒）。日志包含各 `mev_*` 方法的总量、增量、降级率、错误率及缓存条目数。 | 设为 `0` 无效，最小生效值为 1 |
 | `MEV_DEBUG_FIXED_EPOCH` | 未设置 | **仅用于调试**：将 EpochManager 冻结在指定区块高度，所有 `mev_*` 请求始终使用该块的状态。设置后节点不再跟随链头推进。 | ⚠️ 禁止在生产环境设置；启动时会打印 `WARN` 日志警告 |
 | `MEV_DIFF_CACHE` | `1`（启用） | **灰度开关**：控制 Phase 3 精确 Diff 缓存失效逻辑。`1`（或未设置）= Phase 3 启用（`on_epoch_change_diff` + `pre_fill_diff`）；`0` = 回退 Phase 2 全量失效（`invalidate_all()`）。 | 生产遇到问题时，`systemd` 加 `Environment=MEV_DIFF_CACHE=0` 重启即可回退，无需重新部署二进制 |
-| `MEV_REJECT_STALE_CALL` | `1`（启用） | **灰度开关**：控制 Phase 4 `mev_eth_call` 过期请求快速拒绝。`1`（或未设置）= Phase 4 启用，返回 `-39001 EpochMismatch` 错误；`0` = 回退 Phase 3 降级行为（走原生 `eth_call`）。 | Bot 侧适配完成前建议先设 `0` 灰度；确认 Bot 正确处理 `-39001` 后切 `1` |
+| `MEV_REJECT_STALE_CALL` | `1`（启用） | **灰度开关**：控制 Phase 4 三个 `mev_*` 接口的 stale 处理。`1`（或未设置）= Phase 4 启用：`mev_eth_call` 旧请求返回 `-39001`，`mev_debug_traceCall` / `mev_trace_call` 的 `gap=1` 走 worker、`gap>=2` 返回 `-39001`；`0` = 回退 Phase 3 降级行为（走原生接口）。 | Bot 侧适配完成前建议先设 `0` 灰度；确认 Bot 正确处理 `-39001` 后切 `1` |
 
 ### 典型配置示例（`systemd` service）
 

@@ -683,3 +683,82 @@ Environment=MEV_REJECT_STALE_CALL=0
 ```
 
 然后 `systemctl daemon-reload && systemctl restart reth`。
+
+---
+
+## 附录：mid1 accessList 需求补充（后续规划）
+
+### 背景
+
+在 Go 侧 `simulator` 的 `mid1` 阶段，当前每条候选路径会基于不同 `percent` 组装多笔 backrun calldata，并通过 `mev_debug_traceCall` 执行 `callTracer`，以获得调用路径、返回值和 `gasUsed`，供后续收益筛选与下发决策使用。
+
+随着 sender 侧对交易 `accessList` 的使用需求增强，`mid1` 需要额外拿到与当前模拟上下文一致的 access list。但原生 `eth_createAccessList` 有两个问题：
+
+- **上下文不一致**：原生接口只支持 `request + block_id + state_override`，不支持 `blockOverrides`；而当前 `mid1` 明确依赖 next-block 语义（如 `time` / `baseFeePerGas` 覆写）。
+- **执行成本偏高**：`reth` 原生 `eth_createAccessList` 会先用 `AccessListInspector` 执行一次收集 access list，再把 access list 写回 `tx_env` 后第二次 `transact`，用于返回“应用 access list 后”的精确 gas used。
+
+### 问题澄清
+
+本轮讨论后，明确以下几点：
+
+- `mid1` 当前通过 `mev_debug_traceCall` 已能获得本次模拟执行的 `gasUsed`。
+- 若目标只是把 access list 返回给 mevBot / sender，**并不需要**再为 “带 access list 的交易” 额外执行第二遍 `transact`。
+- `Worker-L1` / `GlobalSharedCache` 的访问统计**不能**直接等价为 access list：
+  - 它们记录的是缓存命中 / miss / DB 读取行为；
+  - access list 语义是“本次交易执行实际触达的 address / storage slot 集合”；
+  - 两者在 `bytecode`、重复访问计数、provider 读路径与 EVM 真实访问集之间都不等价。
+
+因此，不能用现有 cache 指标近似生成 access list；必须在 EVM 执行期显式收集。
+
+### 动机
+
+新增自定义 `mev_createAccessList` 的主要动机如下：
+
+- **与 mid1 模拟上下文完全一致**：支持 `stateOverrides + blockOverrides`，避免原生 `eth_createAccessList` 与 `mev_debug_traceCall` 的 block env 不一致。
+- **复用现有 mev 优化主线**：继续走 `EpochManager -> worker pool -> CachedStateProvider -> GlobalSharedCache`，复用 Phase 1~4 已落地的性能路径。
+- **避免无意义的第二遍执行**：access list 生成只需 `AccessListInspector` 一次执行即可，先不追求原生 `eth_createAccessList` 那种“应用 access list 后”的精确 gas used。
+
+### 方案决策
+
+#### 第一阶段：新增最小版 `mev_createAccessList`
+
+采用最小增量方案，新增独立 RPC：
+
+- 方法名：`mev_createAccessList`
+- 入参：对齐 `mev_eth_call`
+  - `request`
+  - `block_id`
+  - `state_overrides`
+  - `block_overrides`
+- 执行方式：
+  - 进入现有 `mev` worker pool
+  - 在 worker 内使用 `AccessListInspector` 收集 access list
+  - **只执行一遍 EVM**
+  - **不做第二遍 `transact`**
+- 返回值：
+  - 最小版本先只返回 `accessList`
+  - 如需兼容原生结构，可后续再讨论是否追加 `error` / `gasUsed` 字段，但默认不要求“应用 access list 后”的 gas used
+
+该方案满足当前需求：在不引入额外重复执行的前提下，为 `mid1` / mevBot 提供与当前模拟上下文一致的 access list。
+
+#### 第二阶段：暂不实现 `mev_debug_traceCallEx`
+
+曾评估过“单接口同时返回 `trace + accessList`”的扩展方案（如 `mev_debug_traceCallEx`），但当前不作为优先项，原因是：
+
+- `mid1` 对同一路径会基于不同 `percent` 发起多次模拟；
+- 若把 trace 与 access list 强绑定在同一接口中，会对不同 `percent` 重复生成 access list；
+- 当前业务更适合先将 access list 作为独立能力补齐，再由调用方决定只在最终候选上生成。
+
+因此，现阶段保持：
+
+- `mev_debug_traceCall`：继续负责 trace / 路径模拟
+- `mev_createAccessList`：独立负责 access list 生成
+
+### 工程约束
+
+本补充方案遵循本文档既有设计原则：
+
+- **不修改前面已定义的主链路语义**；
+- **不改变 `mev_debug_traceCall` 的返回类型**，保持与原生 `debug_traceCall` 的兼容口径；
+- **不使用 cache 统计近似 access list**，避免语义错误；
+- **新增能力优先放入 `crates/mev/` 内部扩展**，继续保持“最小侵入 Reth”原则。

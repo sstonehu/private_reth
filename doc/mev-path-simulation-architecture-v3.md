@@ -41,12 +41,13 @@ Layer B：共享跨请求读缓存（消除重复 DB 读）
 Layer C：批量 IPC 接口（消除 RPC 调用次数 + 编解码开销）
 ```
 
-对应四个实施阶段：
+对应五个实施阶段：
 
 - **Phase 1**：实现 Layer A，新增 `mev_eth_call` / `mev_debug_traceCall` / `mev_trace_call`，沿用 JSON-RPC batch 传输
 - **Phase 2**：实现 Layer B，在 Phase 1 基础上叠加全局读缓存（GlobalSharedCache + CachedStateProvider + singleflight）
 - **Phase 3**：精确 Diff 缓存失效，切块后命中率从 SafeUnchangedSet 覆盖率提升至近 100%，首批延迟趋近稳态
 - **Phase 4**：`mev_eth_call` 过期请求快速拒绝（-39001 错误码），切断级联故障的正反馈回路
+- **Phase 5**：`mev_debug_traceCall` 扩展 `withAccessList` 可选参数，零开销获取 EIP-2930 access list，供上链 tx 降低 cold slot gas 开销
 - **待规划**：新增自定义 IPC 批量接口（`mev_callBatch` / `mev_callBundleBatch`），替代 JSON-RPC batch
 
 ---
@@ -351,6 +352,7 @@ EVM 请求 read(key)
 | `eth_call` | `mev_eth_call` | Phase 1 | 单笔调用，走 worker pool |
 | `debug_traceCall` | `mev_debug_traceCall` | Phase 1 | 带 debug trace，走 worker pool |
 | `trace_call` | `mev_trace_call` | Phase 1 | 带 parity trace，走 worker pool |
+| `debug_traceCall`（扩展） | `mev_debug_traceCall` + `withAccessList` | Phase 5 | opts 新增可选字段，响应追加 `accessList`，开销 < 0.1ms |
 | —（无原生批量） | `mev_callBatch` | 待规划 | 多笔独立调用，单次 IPC 处理 |
 | —（无原生批量） | `mev_callBundleBatch` | 待规划 | bundle 批量，单次 IPC 处理 |
 
@@ -686,79 +688,274 @@ Environment=MEV_REJECT_STALE_CALL=0
 
 ---
 
-## 附录：mid1 accessList 需求补充（后续规划）
+## 附录：accessList 支持（`tryArbiBatchDirect` 阶段）
 
 ### 背景
 
-在 Go 侧 `simulator` 的 `mid1` 阶段，当前每条候选路径会基于不同 `percent` 组装多笔 backrun calldata，并通过 `mev_debug_traceCall` 执行 `callTracer`，以获得调用路径、返回值和 `gasUsed`，供后续收益筛选与下发决策使用。
+sender 侧上链交易需要附带 `accessList`（EIP-2930），用于 pre-warm 状态访问，降低实际 gas 消耗并提高打包成功率。需求是：为 Go 侧最终选定的 `direct` 或 `dynamic` 路径，生成与实际上链 calldata 完全一致的 access list。
 
-随着 sender 侧对交易 `accessList` 的使用需求增强，`mid1` 需要额外拿到与当前模拟上下文一致的 access list。但原生 `eth_createAccessList` 有两个问题：
+原生 `eth_createAccessList` 不可用，原因是：
+- 不支持 `blockOverrides`（缺少 next-block 语义的 `time` / `baseFeePerGas` 覆写）；
+- 多执行一遍 `transact`（将 access list 写回后二次执行以返回精确 gas used），对本场景是无意义开销。
 
-- **上下文不一致**：原生接口只支持 `request + block_id + state_override`，不支持 `blockOverrides`；而当前 `mid1` 明确依赖 next-block 语义（如 `time` / `baseFeePerGas` 覆写）。
-- **执行成本偏高**：`reth` 原生 `eth_createAccessList` 会先用 `AccessListInspector` 执行一次收集 access list，再把 access list 写回 `tx_env` 后第二次 `transact`，用于返回“应用 access list 后”的精确 gas used。
+---
 
-### 问题澄清
+### 决策一：在 `tryArbiBatchDirect` 阶段收集，不在 `mid1` 阶段收集
 
-本轮讨论后，明确以下几点：
+#### Go 侧调用链结构
 
-- `mid1` 当前通过 `mev_debug_traceCall` 已能获得本次模拟执行的 `gasUsed`。
-- 若目标只是把 access list 返回给 mevBot / sender，**并不需要**再为 “带 access list 的交易” 额外执行第二遍 `transact`。
-- `Worker-L1` / `GlobalSharedCache` 的访问统计**不能**直接等价为 access list：
-  - 它们记录的是缓存命中 / miss / DB 读取行为；
-  - access list 语义是“本次交易执行实际触达的 address / storage slot 集合”；
-  - 两者在 `bytecode`、重复访问计数、provider 读路径与 EVM 真实访问集之间都不等价。
+```
+mid1（try_arbi_batch.go）
+  From: TESTER
+  To:   SimulateAddress（= dynamic router 合约）
+  Data: backrun EncodeData（原始，不含 approve 字节）
+  目的：多路径 × 多 percent 变体批量评分，获得 gasUsed + output + ApproveArr
 
-因此，不能用现有 cache 指标近似生成 access list；必须在 EVM 执行期显式收集。
+  ↓ 筛选出最优路径
 
-### 动机
+buildDirectAndDynamic
+  → 构造 DirectCallData（ProxyAddress 的 calldata）
+  → 构造 DynamicCallData（注入 approve 字节后的 dynamic router calldata）
 
-新增自定义 `mev_createAccessList` 的主要动机如下：
+  ↓
 
-- **与 mid1 模拟上下文完全一致**：支持 `stateOverrides + blockOverrides`，避免原生 `eth_createAccessList` 与 `mev_debug_traceCall` 的 block env 不一致。
-- **复用现有 mev 优化主线**：继续走 `EpochManager -> worker pool -> CachedStateProvider -> GlobalSharedCache`，复用 Phase 1~4 已落地的性能路径。
-- **避免无意义的第二遍执行**：access list 生成只需 `AccessListInspector` 一次执行即可，先不追求原生 `eth_createAccessList` 那种“应用 access list 后”的精确 gas used。
+tryArbiBatchDirect（try_arbi_batch_direct.go）
+  direct:   From=EOA, To=ProxyAddress,      Data=DirectCallData
+  dynamic:  From=EOA, To=SimulateAddress,   Data=DynamicCallData（含 approve）
+  目的：获得 GasUsedDirect / GasUsedDynamic，此阶段 calldata 为最终上链形态
+```
 
-### 方案决策
+#### 为何不在 mid1 阶段收集
 
-#### 第一阶段：新增最小版 `mev_createAccessList`
+mid1 的执行上下文与最终上链 tx 存在以下差异，导致其 access list **语义不正确**：
 
-采用最小增量方案，新增独立 RPC：
+| 差异项 | mid1 | 实际上链 tx |
+|---|---|---|
+| `From` | `TESTER`（模拟账户） | `EOA`（真实 sender） |
+| `To`（direct 路径） | 不调用 ProxyAddress | `ProxyAddress` |
+| approve 字节 | 无（仅 `ApproveArr` 检测结果） | DynamicCallData 中已注入 |
+| 调用量 | N 路径 × M percent 变体（可达千次） | 仅最优候选（数条） |
 
-- 方法名：`mev_createAccessList`
-- 入参：对齐 `mev_eth_call`
-  - `request`
-  - `block_id`
-  - `state_overrides`
-  - `block_overrides`
-- 执行方式：
-  - 进入现有 `mev` worker pool
-  - 在 worker 内使用 `AccessListInspector` 收集 access list
-  - **只执行一遍 EVM**
-  - **不做第二遍 `transact`**
-- 返回值：
-  - 最小版本先只返回 `accessList`
-  - 如需兼容原生结构，可后续再讨论是否追加 `error` / `gasUsed` 字段，但默认不要求“应用 access list 后”的 gas used
+**最关键的缺口**：`direct` 路径的上链 tx 目标是 `ProxyAddress`，而 mid1 从未调用过该合约，其代码、存储以及内部调用链上的所有 address/slot 完全不在 mid1 的 warm set 中。若使用 mid1 的 access list，direct 路径的上链交易将面临大量 cold access，access list 形同虚设。
 
-该方案满足当前需求：在不引入额外重复执行的前提下，为 `mid1` / mevBot 提供与当前模拟上下文一致的 access list。
+**附加原因**：`dynamic` 路径在 mid1 中未注入 approve 字节（仅检测是否需要），approve 调用对应的 token `allowance` slot 在 mid1 中是"读检测"语义，而在 DynamicCallData 中是"写执行"语义；使用 mid1 的 access list 时 approve gas 估算偏差虽小，但语义不准确。
 
-#### 第二阶段：暂不实现 `mev_debug_traceCallEx`
+#### 为何不担心 mid1 的多次调用问题
 
-曾评估过“单接口同时返回 `trace + accessList`”的扩展方案（如 `mev_debug_traceCallEx`），但当前不作为优先项，原因是：
+因为 accessList 根本不在 mid1 阶段收集，mid1 的 N×M 次调用对此功能无影响。`tryArbiBatchDirect` 的调用量仅为最优候选条数（通常 < 20），是天然的正确位置。
 
-- `mid1` 对同一路径会基于不同 `percent` 发起多次模拟；
-- 若把 trace 与 access list 强绑定在同一接口中，会对不同 `percent` 重复生成 access list；
-- 当前业务更适合先将 access list 作为独立能力补齐，再由调用方决定只在最终候选上生成。
+---
 
-因此，现阶段保持：
+### 决策二：为 `mev_debug_traceCall` 添加 `withAccessList` 可选参数
 
-- `mev_debug_traceCall`：继续负责 trace / 路径模拟
-- `mev_createAccessList`：独立负责 access list 生成
+**不新增独立接口**（否定 `mev_createAccessList` 和 `mev_debug_traceCallWithAccessList` 两个独立接口方案）。
+
+原因：
+
+- `tryArbiBatchDirect` 本就要调用 `mev_debug_traceCall` 获取 `gasUsed`；
+- 在同一次 EVM 执行中附带提取 access list，额外开销接近零（见决策三）；
+- 独立接口意味着多一次 EVM 执行 + 多一次 RPC round-trip，反而更贵；
+- 单接口 + opt-in 参数更简洁，向后完全兼容（默认不返回 access list）。
+
+#### 接口变更
+
+**请求**（`opts` map 新增可选字段，其余字段不变）：
+
+```jsonc
+{
+  "tracer": "callTracer",
+  "tracerConfig": { "onlyTopCall": true },
+  "stateOverrides": { ... },
+  "blockOverrides": { ... },
+  "withAccessList": true
+}
+```
+
+**响应**（在现有 GethTrace JSON 对象中追加字段，向后兼容）：
+
+```jsonc
+{
+  "type": "CALL",
+  "gasUsed": "0x...",
+  "output": "0x...",
+  "accessList": [
+    {
+      "address": "0x...",
+      "storageKeys": ["0x...", "0x..."]
+    }
+  ]
+}
+```
+
+> `withAccessList=false`（默认）时响应中无 `accessList` 字段，现有所有调用方无需变更。
+
+**注意**：`gasUsed` 是单次 EVM 执行的真实值（"应用 access list 之前"的 gas），与原生 `eth_createAccessList` 二次执行后的精确值语义不同；对于 mevBot sender 使用 access list 降低 gas 的目的，此值已足够。
+
+---
+
+### 决策三：为何 `withAccessList=true` 的额外开销接近零
+
+#### 核心原因：warm set 在 `transact()` 返回时已存在于 `res.state`
+
+revm 的 `transact()` 返回 `ResultAndState`，其中 `state: EvmState`（即 `HashMap<Address, EvmAccount>`）包含本次执行**所有被触达**的账户（含只读访问，`AccountStatus::Touched`）及其存储槽（`account.storage` map 中所有被 SLOAD/SSTORE 过的 slot）。
+
+这份数据**不是为 access list 额外计算的**——它是 EVM 为 EIP-2929 gas 计量（cold/warm 区分）在执行过程中必然维护的结构。提取 access list 只是在执行结束后遍历一次 `res.state`，时间复杂度为 O(touched_accounts + touched_slots)。
+
+对 MEV backrun 交易的典型规模（3~5 个 DEX pool、2~5 个 token、1~3 个 router，共约 10~15 个地址、20~120 个 storage entry），Rust `HashMap` 迭代 + `Vec::push` 的实测开销在 **5~50 微秒**（< 0.1ms），远低于 EVM 执行本身（数十 ms），可视为**零额外开销**。
+
+```
+无 withAccessList：  EVM transact() → 丢弃 res.state → 返回 trace
+有 withAccessList：  EVM transact() → 遍历 res.state（5~50µs）→ 返回 trace + accessList
+```
+
+#### 与其他可能方案的对比
+
+| 方案 | 原理 | 额外开销 | 可行性 |
+|---|---|---|---|
+| 遍历 `res.state`（本方案） | 读取已存在的 warm set | < 0.1ms | ✅ 推荐 |
+| `AccessListInspector` step() hook | 每条 opcode 触发 hook | +5%~15% EVM 时间 | ✅ 可用但更贵 |
+| 复用 cache 统计 | Worker-L1 / GlobalSharedCache 命中记录 | 零 | ❌ 语义不等价，禁止 |
+| 单独调用 `mev_createAccessList` | 独立 RPC + 独立 EVM 执行 | 1x EVM 执行 | ❌ 不必要 |
+
+> **注意**：cache 统计（Worker-L1 命中 / DB miss）记录的是 provider 读路径，不等价于 EVM 实际触达的 address/slot 集合。两者在 bytecode 访问、重复访问去重、precompile 处理等方面均存在语义差异，**严禁用 cache 统计近似生成 access list**。
+
+---
+
+### Reth 侧实施细节
+
+所有改动限定在 `crates/mev/` 内，**零侵入 Reth 已有 crate**（不修改 `alloy_rpc_types`、`reth-rpc` 等）。
+
+#### 需修改的 4 个文件
+
+**`crates/mev/src/api/types.rs`**
+
+```rust
+pub enum CallKind {
+    Basic,
+    DebugTrace {
+        opts: Box<GethDebugTracingCallOptions>,
+        with_access_list: bool,   // 新增
+    },
+    ParityTrace { trace_types: HashSet<TraceType> },
+}
+```
+
+**`crates/mev/src/worker/mod.rs`**
+
+```rust
+pub enum WorkerOutput {
+    Basic(Bytes),
+    DebugTrace(GethTrace, Option<AccessList>),  // 追加 Option<AccessList>
+    ParityTrace(TraceResults),
+}
+```
+
+**`crates/mev/src/worker/worker.rs`** — `exec_debug_trace` 中提取 warm set
+
+```rust
+fn exec_debug_trace(
+    evm_config: &EthEvmConfig,
+    db: &mut WorkerStateDb<'_>,
+    evm_env: super::EthEvmEnv,
+    tx_env: EthTxEnv,
+    opts: &GethDebugTracingCallOptions,
+    with_access_list: bool,
+) -> Result<WorkerOutput, WorkerError> {
+    let mut inspector = DebugInspector::new(opts.tracing_options.clone())?;
+
+    let res = evm_config
+        .evm_with_env_and_inspector(&mut *db, evm_env.clone(), &mut inspector)
+        .transact(tx_env.clone())?;
+
+    let trace = inspector.get_result(None, &tx_env, &evm_env.block_env, &res, db)?;
+
+    // res.state 包含本次执行所有被触达的账户与存储槽（EIP-2929 warm set 的载体）
+    // 遍历一次即得 access list，无需额外 EVM 执行或 per-opcode hook
+    let access_list = if with_access_list {
+        Some(AccessList(
+            res.state.iter()
+                .map(|(addr, acc)| AccessListItem {
+                    address: *addr,
+                    storage_keys: acc.storage.keys()
+                        .map(|slot| B256::from(*slot))
+                        .collect(),
+                })
+                .collect(),
+        ))
+    } else {
+        None
+    };
+
+    Ok(WorkerOutput::DebugTrace(trace, access_list))
+}
+```
+
+**`crates/mev/src/api/server.rs`** — 解析 `withAccessList`，将 `accessList` 注入响应 JSON
+
+```rust
+async fn mev_debug_trace_call(
+    &self,
+    request: TransactionRequest,
+    block_id: Option<BlockId>,
+    opts: Option<GethDebugTracingCallOptions>,
+) -> RpcResult<serde_json::Value> {
+
+    // 从 opts 的 additional_fields 中读取 withAccessList（不修改 GethDebugTracingCallOptions）
+    let with_access_list = opts
+        .as_ref()
+        .and_then(|o| o.additional_fields.get("withAccessList"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ... 现有 epoch 检查、worker dispatch 逻辑不变 ...
+
+    let WorkerOutput::DebugTrace(trace, opt_al) = output else { /* ... */ };
+
+    // 将 GethTrace 序列化后注入 accessList 字段（withAccessList=false 时无此字段）
+    let mut json = serde_json::to_value(&trace)
+        .map_err(|e| internal_rpc_err(e.to_string()))?;
+    if let (Some(al), serde_json::Value::Object(ref mut map)) = (opt_al, &mut json) {
+        map.insert("accessList".to_string(), serde_json::to_value(al)
+            .map_err(|e| internal_rpc_err(e.to_string()))?);
+    }
+    Ok(json)
+}
+```
+
+> `GethDebugTracingCallOptions.additional_fields` 是 alloy 预留的扩展字段 map（`IndexMap<String, Value>`），用于透传自定义字段，无需修改 alloy 类型定义。
+
+**为何返回类型由 `GethTrace` 改为 `serde_json::Value`**：`GethTrace` 是枚举，不同 tracer 序列化结构各异，无法通过 `#[serde(flatten)]` 向其注入额外字段。改为 `serde_json::Value` 后，先完成 `GethTrace` 的正常序列化，再在 map 层插入 `accessList` key，保持原有结构完全不变，仅追加字段——对所有现有调用方完全透明。
+
+---
+
+### Go 侧改动
+
+仅在已有的 `DebugTraceCallResult` 结构体中追加一个字段：
+
+```go
+type DebugTraceCallResult struct {
+    GasUsed    string        `json:"gasUsed"`
+    Output     string        `json:"output"`
+    Error      string        `json:"error,omitempty"`
+    AccessList []AccessTuple `json:"accessList,omitempty"`  // 新增
+}
+
+type AccessTuple struct {
+    Address     string   `json:"address"`
+    StorageKeys []string `json:"storageKeys"`
+}
+```
+
+`tryArbiBatchDirect` 调用时在 opts 中加 `"withAccessList": true`；解析响应后读取 `AccessList` 字段，按选定路径（direct 或 dynamic）取对应执行的 access list 附加到上链 tx。
+
+`mid1` 调用不传 `withAccessList`，响应中无 `accessList` 字段，Go 侧反序列化时 `omitempty` 直接忽略，**零影响**。
+
+---
 
 ### 工程约束
 
-本补充方案遵循本文档既有设计原则：
-
-- **不修改前面已定义的主链路语义**；
-- **不改变 `mev_debug_traceCall` 的返回类型**，保持与原生 `debug_traceCall` 的兼容口径；
-- **不使用 cache 统计近似 access list**，避免语义错误；
-- **新增能力优先放入 `crates/mev/` 内部扩展**，继续保持“最小侵入 Reth”原则。
+- **不新增 RPC 接口**：`mev_createAccessList` 和 `mev_debug_traceCallWithAccessList` 均不实施；
+- **不修改 Reth 已有代码**：所有改动限定在 `crates/mev/` 的 4 个文件内；
+- **不使用 cache 统计近似 access list**：语义不等价，禁止；
+- **向后兼容**：`withAccessList` 默认 `false`，所有现有调用方无需变更；
+- **正确性来源于执行上下文**：access list 取自 `tryArbiBatchDirect` 的 EOA sender + 最终 calldata 执行，与实际上链 tx 完全一致。

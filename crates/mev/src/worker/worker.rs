@@ -5,6 +5,8 @@ use crate::{
     epoch::EpochContext,
     provider::{CachedStateProvider, ProviderStats},
 };
+use alloy_eips::eip2930::{AccessList, AccessListItem};
+use alloy_primitives::B256;
 use alloy_primitives::map::HashSet;
 use crossbeam_channel::Receiver;
 use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm, TransactionEnvMut};
@@ -141,8 +143,15 @@ impl MevWorker {
 
         let result = match &task.kind {
             CallKind::Basic => Self::exec_basic(&evm_config, &mut db, evm_env, tx_env),
-            CallKind::DebugTrace { opts } => {
-                Self::exec_debug_trace(&evm_config, &mut db, evm_env, tx_env, opts)
+            CallKind::DebugTrace { opts, with_access_list } => {
+                Self::exec_debug_trace(
+                    &evm_config,
+                    &mut db,
+                    evm_env,
+                    tx_env,
+                    opts,
+                    *with_access_list,
+                )
             }
             CallKind::ParityTrace { trace_types } => Self::exec_parity_trace(
                 &evm_config,
@@ -189,6 +198,7 @@ impl MevWorker {
         evm_env: super::EthEvmEnv,
         tx_env: EthTxEnv,
         opts: &alloy_rpc_types_trace::geth::GethDebugTracingCallOptions,
+        with_access_list: bool,
     ) -> Result<WorkerOutput, WorkerError> {
         let mut inspector = DebugInspector::new(opts.tracing_options.clone())
             .map_err(|err| WorkerError::Inspect(format!("{err:?}")))?;
@@ -202,7 +212,25 @@ impl MevWorker {
             .get_result(None, &tx_env, &evm_env.block_env, &res, db)
             .map_err(|err| WorkerError::Inspect(format!("{err:?}")))?;
 
-        Ok(WorkerOutput::DebugTrace(trace))
+        // res.state 包含本次执行所有被触达的账户与存储槽（EIP-2929 warm set 的载体）。
+        // 遍历一次即得 EIP-2930 access list，无需额外 EVM 执行或 per-opcode hook（< 0.1ms）。
+        // 预编译合约地址不会出现在 res.state 中（走 warm_preloaded_addresses 早路径，
+        // 不经 load_account_with_code），自然被过滤，行为与 eth_createAccessList 一致。
+        let access_list = if with_access_list {
+            let items: Vec<AccessListItem> = res
+                .state
+                .iter()
+                .map(|(addr, acc)| AccessListItem {
+                    address: *addr,
+                    storage_keys: acc.storage.keys().map(|slot| B256::from(*slot)).collect(),
+                })
+                .collect();
+            Some(AccessList(items))
+        } else {
+            None
+        };
+
+        Ok(WorkerOutput::DebugTrace(trace, access_list))
     }
 
     fn exec_parity_trace(

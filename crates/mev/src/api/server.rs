@@ -1,5 +1,5 @@
 use crate::{
-    api::types::CallKind,
+    api::types::{CallKind, MevDebugTracingCallOptions},
     epoch::{EpochContext, EpochManager},
     metrics::{self, method, MevCounters},
     worker::{MevWorkerPool, WorkerError, WorkerOutput, WorkerTask},
@@ -8,7 +8,6 @@ use alloy_network::TransactionBuilder;
 use alloy_primitives::{map::HashSet, Bytes};
 use alloy_rpc_types_eth::{state::StateOverride, BlockId, BlockOverrides, TransactionRequest};
 use alloy_rpc_types_trace::{
-    geth::{GethDebugTracingCallOptions, GethTrace},
     parity::{TraceResults, TraceType},
     tracerequest::TraceCallRequest,
 };
@@ -180,8 +179,8 @@ where
         &self,
         request: TransactionRequest,
         block_id: Option<BlockId>,
-        opts: Option<GethDebugTracingCallOptions>,
-    ) -> RpcResult<GethTrace> {
+        opts: Option<MevDebugTracingCallOptions>,
+    ) -> RpcResult<serde_json::Value> {
         let t0 = Instant::now();
         let c = &self.counters.debug_trace_call;
         metrics::record_request(method::DEBUG_TRACE, c);
@@ -191,16 +190,18 @@ where
             if !self.reject_stale_call {
                 metrics::record_degraded_path(method::DEBUG_TRACE, c);
                 metrics::record_degraded_gap(method::DEBUG_TRACE, gap);
+                let inner_opts = opts.map(|o| o.inner).unwrap_or_default();
                 let result = self
                     .debug_api
-                    .debug_trace_call(request, block_id, opts.unwrap_or_default())
+                    .debug_trace_call(request, block_id, inner_opts)
                     .await
                     .map_err(Into::into);
                 metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
-                return result;
+                return result.and_then(|trace| {
+                    serde_json::to_value(&trace).map_err(|e| internal_rpc_err(e.to_string()))
+                });
             }
             if gap != Some(1) {
-                // gap >= 2 or non-number block_id: fast rejection.
                 metrics::record_epoch_mismatch(method::DEBUG_TRACE, gap);
                 metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
                 return Err(epoch_mismatch_error(
@@ -209,16 +210,17 @@ where
                     gap,
                 ));
             }
-            // gap == Some(1): drain — record and fall through to worker path.
-            // Execute on current epoch N; path simulation on latest state remains useful.
-            // Record as "drain" so the gap-count dashboard captures all non-zero gap events.
             metrics::record_epoch_mismatch(method::DEBUG_TRACE, gap);
         }
 
         metrics::record_worker_path(method::DEBUG_TRACE, c);
-        let opts = opts.unwrap_or_default();
-        let state_overrides = opts.state_overrides.clone();
-        let block_overrides = opts.block_overrides.clone().map(Box::new);
+
+        let mev_opts = opts.unwrap_or_default();
+        let with_access_list = mev_opts.with_access_list;
+        let inner_opts = mev_opts.inner;
+
+        let state_overrides = inner_opts.state_overrides.clone();
+        let block_overrides = inner_opts.block_overrides.clone().map(Box::new);
 
         let epoch = self.epoch_manager.current();
         let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
@@ -232,14 +234,23 @@ where
             tx_env,
             block_overrides,
             state_overrides,
-            kind: CallKind::DebugTrace { opts: Box::new(opts) },
+            kind: CallKind::DebugTrace { opts: Box::new(inner_opts), with_access_list },
             result_tx,
         };
 
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
 
         let result = match result_rx.await {
-            Ok(Ok(WorkerOutput::DebugTrace(trace))) => Ok(trace),
+            Ok(Ok(WorkerOutput::DebugTrace(trace, opt_al))) => {
+                let mut json =
+                    serde_json::to_value(&trace).map_err(|e| internal_rpc_err(e.to_string()))?;
+                if let (Some(al), serde_json::Value::Object(map)) = (opt_al, &mut json) {
+                    let al_value =
+                        serde_json::to_value(&al).map_err(|e| internal_rpc_err(e.to_string()))?;
+                    map.insert("accessList".to_string(), al_value);
+                }
+                Ok(json)
+            }
             Ok(Err(err)) => {
                 metrics::record_error(method::DEBUG_TRACE, "worker_error", c);
                 Err(internal_rpc_err(err.to_string()))

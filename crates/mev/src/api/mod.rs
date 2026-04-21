@@ -3,11 +3,9 @@ pub mod types;
 
 use alloy_primitives::Bytes;
 use alloy_rpc_types_eth::{state::StateOverride, BlockId, BlockOverrides, TransactionRequest};
-use alloy_rpc_types_trace::{
-    geth::{GethDebugTracingCallOptions, GethTrace},
-    parity::{TraceResults, TraceType},
-};
+use alloy_rpc_types_trace::parity::{TraceResults, TraceType};
 use jsonrpsee::proc_macros::rpc;
+use crate::api::types::MevDebugTracingCallOptions;
 
 #[rpc(server, namespace = "mev")]
 pub trait MevApi {
@@ -22,13 +20,15 @@ pub trait MevApi {
     ) -> jsonrpsee::core::RpcResult<Bytes>;
 
     /// 等价于 `debug_traceCall`，执行路径走 worker pool。
+    /// Phase 5：opts 中可传入 `"withAccessList": true`，响应追加 `accessList` 字段（EIP-2930）。
+    /// 不传或传 `false` 时响应与原有完全一致。
     #[method(name = "debug_traceCall")]
     async fn mev_debug_trace_call(
         &self,
         request: TransactionRequest,
         block_id: Option<BlockId>,
-        opts: Option<GethDebugTracingCallOptions>,
-    ) -> jsonrpsee::core::RpcResult<GethTrace>;
+        opts: Option<MevDebugTracingCallOptions>,
+    ) -> jsonrpsee::core::RpcResult<serde_json::Value>;
 
     /// 等价于 `trace_call`，执行路径走 worker pool。
     #[method(name = "trace_call")]

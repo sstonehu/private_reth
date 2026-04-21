@@ -666,9 +666,90 @@ Step 2（Go 侧，Reth 侧上线后）
 
 ---
 
-## 9. 实施说明（待填写）
+## 9. 实施说明（2026-04-21）
 
-> 本节待实施完成后填写，记录工程实际差异与测试结果。
+### 9.1 已实施结果（Reth 侧）
+
+Phase 5 已在 `crates/mev/` 完成落地，核心行为如下：
+
+- `mev_debug_traceCall` 请求 `opts` 扩展为 `MevDebugTracingCallOptions`，支持 `withAccessList`（默认 `false`）。
+- worker 侧在单次 `transact()` 后遍历 `res.state`，提取 `AccessList`，不增加额外 EVM 执行。
+- RPC 返回类型改为 `serde_json::Value`，在 `withAccessList=true` 时向 trace JSON 追加 `accessList` 字段；默认无该字段。
+- stale 降级路径（`MEV_REJECT_STALE_CALL=0`）保持兼容：仍走原生 `debug_trace_call`，并统一序列化为 `Value` 返回。
+
+本次实际修改文件（Reth 侧）：
+
+1. `crates/mev/Cargo.toml`
+2. `crates/mev/src/api/types.rs`
+3. `crates/mev/src/api/mod.rs`
+4. `crates/mev/src/worker/mod.rs`
+5. `crates/mev/src/worker/worker.rs`
+6. `crates/mev/src/api/server.rs`
+
+### 9.2 验证结果
+
+- `cargo check -p reth-mev`：通过
+- `cargo nextest run -p reth-mev`：通过（`8 passed, 0 skipped`）
+
+### 9.3 与设计不一致/需澄清之处
+
+1. **文件数量表述不一致**  
+   本文 `10. Codex 实现 Prompt` 中写“共 5 个文件”，但同一段落的细分清单实际覆盖了 **6 个文件**（包含 `api/server.rs`）。工程落地按 6 个文件执行。
+
+2. **文档内“4 个文件”表述已过期**  
+   总架构文档附录中“Reth 侧实施细节”写“需修改 4 个文件”，与 Phase 5 详设不一致。实际 Reth 侧实现需要 `Cargo.toml` + `api/mod.rs` + 其余核心文件，总计 6 个。
+
+3. **`serde_json::Value::Object` 的模式匹配写法差异（Rust 2024）**  
+   设计示例中使用：
+   `serde_json::Value::Object(ref mut map)`  
+   实际编译环境（Rust 2024 绑定模式）需写为：
+   `serde_json::Value::Object(map)`  
+   二者语义等价，均为在对象上插入 `accessList` 字段。
+
+### 9.4 正式代码评审结果（2026-04-21）
+
+逐文件与设计文档对照评审，结论：**代码与设计完全一致，所有验收标准通过**。
+
+#### 逐文件核对
+
+| 文件 | 设计要求 | 实际代码 | 符合 |
+|------|---------|----------|------|
+| `Cargo.toml` | `serde_json.workspace = true` | 已添加 | ✅ |
+| `api/types.rs` | `MevDebugTracingCallOptions`，`#[serde(flatten)]` + `with_access_list: bool` | 第 7-17 行，完全一致 | ✅ |
+| `api/types.rs` | `CallKind::DebugTrace` 加 `with_access_list: bool` 字段 | 第 25-29 行 | ✅ |
+| `api/mod.rs` | 移除 `GethDebugTracingCallOptions` import，引入包装类型 | 第 6、8 行 | ✅ |
+| `api/mod.rs` | 返回类型 `RpcResult<serde_json::Value>` | 第 31 行 | ✅ |
+| `worker/mod.rs` | `use alloy_eips::eip2930::AccessList` | 第 5 行 | ✅ |
+| `worker/mod.rs` | `WorkerOutput::DebugTrace(GethTrace, Option<AccessList>)` | 第 54 行 | ✅ |
+| `worker/worker.rs` | `AccessList`、`AccessListItem`、`B256` 导入 | 第 8-9 行 | ✅ |
+| `worker/worker.rs` | `exec_debug_trace` 签名加 `with_access_list: bool` | 第 198 行 | ✅ |
+| `worker/worker.rs` | `execute_task` 调用点 `*with_access_list` 解引用 | 第 153 行 | ✅ |
+| `worker/worker.rs` | `res.state.iter()` 遍历生成 `AccessList`，`B256::from(*slot)` | 第 216-228 行 | ✅ |
+| `api/server.rs` | 导入替换，方法签名更新 | 第 2、10-13、182-183 行 | ✅ |
+| `api/server.rs` | 降级路径提取 `inner_opts`，结果序列化为 `Value` | 第 193、200-202 行 | ✅ |
+| `api/server.rs` | `with_access_list` 拆解 + dispatch + `accessList` 注入 | 第 218-251 行 | ✅ |
+
+#### 验收标准核查
+
+| 验收项 | 结果 |
+|--------|------|
+| `cargo check -p reth-mev`：零错误零警告 | ✅ Finished in 6.85s |
+| `cargo nextest run -p reth-mev`：全部通过 | ✅ 8/8 passed, 0 skipped |
+| `withAccessList=false`（默认）：响应不含 `accessList` | ✅ `None` 分支不插入字段 |
+| `withAccessList=true`：响应追加 `accessList` 字段 | ✅ 遍历 `res.state` 后插入 |
+| 降级路径行为正确 | ✅ `inner_opts` 传原生接口，无 `accessList` |
+| 不修改 Reth 已有 crate | ✅ 所有改动限定在 `crates/mev/` |
+| 向后兼容（旧调用方不传 `withAccessList`） | ✅ `#[serde(default)]` 默认 `false` |
+
+#### 与设计文档差异归纳
+
+| 差异 | 说明 | 影响 |
+|------|------|------|
+| `Value::Object(map)` vs `Value::Object(ref mut map)` | Rust 2024 自动推断 `ref mut`，语义等价 | 无 |
+| 文件数 "5 个" → 实际 6 个 | `Cargo.toml` 在正文"设计概览"中漏列，Codex Prompt 中已正确包含 | 无（文档小瑕疵，不影响实现） |
+| 主架构文档附录遗留 `additional_fields` 草稿写法 | 评审时已同步修正为 `MevDebugTracingCallOptions` 方案 | 无 |
+
+**Phase 5 Reth 侧实施完成。待 Go 侧（Step 2）完成后关闭本阶段。**
 
 ---
 
@@ -929,11 +1010,6 @@ use alloy_rpc_types_trace::{
     tracerequest::TraceCallRequest,
 };
 use crate::api::types::MevDebugTracingCallOptions;
-```
-
-并在 `use` 块中添加（若未存在）：
-```rust
-use serde_json;
 ```
 
 #### 6.2 整体替换 `mev_debug_trace_call` 方法

@@ -1,6 +1,20 @@
 use alloy_primitives::map::HashSet;
 use alloy_rpc_types_trace::{geth::GethDebugTracingCallOptions, parity::TraceType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// `mev_debug_traceCall` 的请求选项，在标准 [`GethDebugTracingCallOptions`] 基础上
+/// 新增 MEV 扩展字段。使用 `#[serde(flatten)]` 完全向后兼容原有调用方。
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MevDebugTracingCallOptions {
+    /// 标准 alloy trace 选项（tracer、tracerConfig、stateOverrides、blockOverrides 等）。
+    #[serde(flatten)]
+    pub inner: GethDebugTracingCallOptions,
+    /// 若为 `true`，执行后遍历 `res.state` 提取 EIP-2930 access list 附加到响应。
+    /// 开销 < 0.1ms；默认 `false`，旧调用方无需改动。
+    #[serde(default)]
+    pub with_access_list: bool,
+}
 
 /// Worker 执行的调用类型。
 #[derive(Debug)]
@@ -8,7 +22,11 @@ pub enum CallKind {
     /// `mev_eth_call`
     Basic,
     /// `mev_debug_traceCall`
-    DebugTrace { opts: Box<GethDebugTracingCallOptions> },
+    DebugTrace {
+        opts: Box<GethDebugTracingCallOptions>,
+        /// 若为 true，worker 在执行后从 res.state 提取 access list 随 trace 一起返回。
+        with_access_list: bool,
+    },
     /// `mev_trace_call`
     ParityTrace { trace_types: HashSet<TraceType> },
 }

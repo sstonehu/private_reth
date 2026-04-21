@@ -2,6 +2,7 @@ pub mod cache;
 mod worker;
 
 use crate::{api::types::CallKind, epoch::EpochContext};
+use alloy_eips::eip2930::AccessList;
 use alloy_primitives::Bytes;
 use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides};
 use alloy_rpc_types_trace::{geth::GethTrace, parity::TraceResults};
@@ -48,7 +49,9 @@ pub type WorkerResult = Result<WorkerOutput, WorkerError>;
 #[derive(Debug)]
 pub enum WorkerOutput {
     Basic(Bytes),
-    DebugTrace(GethTrace),
+    /// debug trace 结果。第二个字段：`with_access_list=true` 时为从 `res.state` 提取的
+    /// EIP-2930 access list，否则为 `None`。
+    DebugTrace(GethTrace, Option<AccessList>),
     ParityTrace(TraceResults),
 }
 

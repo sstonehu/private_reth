@@ -892,24 +892,21 @@ fn exec_debug_trace(
 
 **`crates/mev/src/api/server.rs`** — 解析 `withAccessList`，将 `accessList` 注入响应 JSON
 
+> **注意**：alloy 1.6.x 的 `GethDebugTracingCallOptions` 没有 `additional_fields` 扩展字段。实际实现通过在 `api/types.rs` 新增 `MevDebugTracingCallOptions` 包装类型来传递 `with_access_list`，详见 [Phase 5 详设](./Reth_simulate_optimize_phase5.md)。
+
 ```rust
 async fn mev_debug_trace_call(
     &self,
     request: TransactionRequest,
     block_id: Option<BlockId>,
-    opts: Option<GethDebugTracingCallOptions>,
+    opts: Option<MevDebugTracingCallOptions>,   // 包装类型，含 with_access_list 字段
 ) -> RpcResult<serde_json::Value> {
 
-    // 从 opts 的 additional_fields 中读取 withAccessList（不修改 GethDebugTracingCallOptions）
-    let with_access_list = opts
-        .as_ref()
-        .and_then(|o| o.additional_fields.get("withAccessList"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mev_opts = opts.unwrap_or_default();
+    let with_access_list = mev_opts.with_access_list;
+    let inner_opts = mev_opts.inner;
 
-    // ... 现有 epoch 检查、worker dispatch 逻辑不变 ...
-
-    let WorkerOutput::DebugTrace(trace, opt_al) = output else { /* ... */ };
+    // ... 现有 epoch 检查、worker dispatch 逻辑（使用 inner_opts） ...
 
     // 将 GethTrace 序列化后注入 accessList 字段（withAccessList=false 时无此字段）
     let mut json = serde_json::to_value(&trace)
@@ -921,8 +918,6 @@ async fn mev_debug_trace_call(
     Ok(json)
 }
 ```
-
-> `GethDebugTracingCallOptions.additional_fields` 是 alloy 预留的扩展字段 map（`IndexMap<String, Value>`），用于透传自定义字段，无需修改 alloy 类型定义。
 
 **为何返回类型由 `GethTrace` 改为 `serde_json::Value`**：`GethTrace` 是枚举，不同 tracer 序列化结构各异，无法通过 `#[serde(flatten)]` 向其注入额外字段。改为 `serde_json::Value` 后，先完成 `GethTrace` 的正常序列化，再在 map 层插入 `accessList` key，保持原有结构完全不变，仅追加字段——对所有现有调用方完全透明。
 
@@ -959,3 +954,23 @@ type AccessTuple struct {
 - **不使用 cache 统计近似 access list**：语义不等价，禁止；
 - **向后兼容**：`withAccessList` 默认 `false`，所有现有调用方无需变更；
 - **正确性来源于执行上下文**：access list 取自 `tryArbiBatchDirect` 的 EOA sender + 最终 calldata 执行，与实际上链 tx 完全一致。
+
+---
+
+### 实施落地记录（2026-04-21）
+
+Phase 5 已完成 Reth 侧实现并通过验证（`cargo check -p reth-mev`、`cargo nextest run -p reth-mev`）。
+
+实际落地文件为 6 个：
+
+1. `crates/mev/Cargo.toml`
+2. `crates/mev/src/api/types.rs`
+3. `crates/mev/src/api/mod.rs`
+4. `crates/mev/src/worker/mod.rs`
+5. `crates/mev/src/worker/worker.rs`
+6. `crates/mev/src/api/server.rs`
+
+与本文现有设计描述的差异如下：
+
+- 本文“Reth 侧实施细节 / 工程约束”写的是“4 个文件”，该表述已过期；实际需要 6 个文件（含 `Cargo.toml` 与 `api/mod.rs`）。
+- 示例代码中的 `serde_json::Value::Object(ref mut map)` 在 Rust 2024 下需调整为 `serde_json::Value::Object(map)` 才能通过编译；语义不变。

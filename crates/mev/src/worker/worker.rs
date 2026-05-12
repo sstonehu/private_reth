@@ -7,7 +7,7 @@ use crate::{
 };
 use alloy_primitives::map::HashSet;
 use crossbeam_channel::Receiver;
-use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm, TransactionEnv};
+use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm, TransactionEnvMut};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::Database as _;
@@ -174,8 +174,11 @@ impl MevWorker {
         match res.result {
             ExecutionResult::Success { output, .. } => Ok(WorkerOutput::Basic(output.into_data())),
             ExecutionResult::Revert { output, .. } => Err(WorkerError::Revert(output)),
-            ExecutionResult::Halt { reason, gas_used } => {
-                Err(WorkerError::Halt { reason: format!("{reason:?}"), gas_used })
+            ExecutionResult::Halt { reason, gas, .. } => {
+                Err(WorkerError::Halt {
+                    reason: format!("{reason:?}"),
+                    gas_used: gas.tx_gas_used(),
+                })
             }
         }
     }

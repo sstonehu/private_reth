@@ -52,6 +52,8 @@
 
 // Used in feature flags only (`asm-keccak`, `keccak-cache-global`)
 use alloy_primitives as _;
+// Used in main.rs via install_mev_rpc
+use reth_mev as _;
 
 pub mod cli;
 

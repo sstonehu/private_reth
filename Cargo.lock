@@ -7377,6 +7377,7 @@ dependencies = [
  "reth-ethereum-cli",
  "reth-ethereum-payload-builder",
  "reth-ethereum-primitives",
+ "reth-mev",
  "reth-network",
  "reth-network-api",
  "reth-node-api",
@@ -8865,6 +8866,48 @@ dependencies = [
  "reth-primitives-traits",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "reth-mev"
+version = "2.2.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.4",
+ "alloy-evm",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "alloy-rpc-types-trace",
+ "async-trait",
+ "crossbeam-channel",
+ "eyre",
+ "jsonrpsee",
+ "metrics",
+ "moka",
+ "reth-chain-state",
+ "reth-chainspec",
+ "reth-errors",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-network-api",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-revm",
+ "reth-rpc",
+ "reth-rpc-api",
+ "reth-rpc-convert",
+ "reth-rpc-eth-api",
+ "reth-rpc-eth-types",
+ "reth-rpc-server-types",
+ "reth-storage-api",
+ "revm",
+ "revm-inspectors",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

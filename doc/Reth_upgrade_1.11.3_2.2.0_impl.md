@@ -1,12 +1,12 @@
 # Reth `v1.11.3.local` → `v2.2.0.local` 升级实施记录
 
 > 配套设计文档：[`Reth_upgrade_1.11.3_2.2.0.md`](./Reth_upgrade_1.11.3_2.2.0.md)
-> 状态：🟡 实施中（迭代 #1 ⚠️ Conditional Pass；§2A 文档闭环已完成；§2B DevOps 工单待办）
-> 实施 Agent：Claude Sonnet 4.6（代码迁移）+ DevOps（Step 7~9 测试节点验证）
+> 状态：🟡 实施中（迭代 #1 ⚠️ Conditional Pass；§1.4 基线追平 C5 cherry-pick 已完成；§2A 文档闭环已完成；§2B DevOps 工单待办）
+> 实施 Agent：Claude Sonnet 4.6（代码迁移）+ Claude Opus 4.7（C5 cherry-pick）+ DevOps（Step 7~9 测试节点验证）
 > Review Agent：Claude Opus 4.7
 > 文档负责人：`<填写>`
 > 创建日期：2026-05-12
-> 最后更新：2026-05-13 01:00 UTC+8（方案 A 执行 §2A）
+> 最后更新：2026-05-13 08:30 UTC+8（§1.4 完成 C5 cherry-pick & 三段 cargo 校验）
 
 ---
 
@@ -296,6 +296,136 @@ Review 完成时间：`2026-05-13 00:30 UTC+8`
 
 ---
 
+### 1.4 v1.11.3.local 基线追平（C5 cherry-pick，2026-05-13 补）
+
+> 触发条件：在 §2A 文档闭环执行后、§2B DevOps 工单启动前，复盘 v1.11.3.local 与 v2.2.0.local 的 commit chain 时发现：v1.11.3.local 在升级工作启动后又追加了 1 个业务 commit，需要回填到 v2.2.0.local，否则两条分支的 MEV 功能集合不再等价（违反 §1.1 prompt「行为完全等价」的初始前提）。
+> 处置原则：**最小化、不破坏 C1~C4 已稳定的升级链、不重做 v2.2.0.local**。
+> 执行 Agent：`Claude Opus 4.7`（手动 cherry-pick + 三段 cargo 校验，无需 Sonnet 介入）。
+
+#### 1.4.1 基线对齐核实
+
+启动 §2A 工作流后再次检视 v1.11.3.local 与 `pre-upgrade-v1.11.3.local` 标签的差异：
+
+```bash
+git rev-parse pre-upgrade-v1.11.3.local   # 33c11aac7（不是用户记忆的 239ea48e3c）
+git log --oneline pre-upgrade-v1.11.3.local..v1.11.3.local
+# → 6786b11cb  1. reth phase5. add accessList for mev_debug_traceCall
+```
+
+实测**只缺 1 个 commit**，不是 2 个：
+
+| Commit | 类型 | 内容 | 是否已 port |
+|---|---|---|---|
+| `239ea48e3c` | doc（最初 design 草稿） | `doc/mev-path-simulation-architecture-v3.md` (+79) | ✅ 已包含在 C4 之前的基线（早于 pre-upgrade-v1.11.3.local 标签） |
+| `33c11aac7`  | doc（设计文档完善） | `doc/Reth_simulate_optimize_phase5.md` (+1051) + `doc/mev-path-simulation-architecture-v3.md` (+301) | ✅ 已在 v2.2.0.local C4（`68a806d47`）port，diff 为空 |
+| `6786b11cb`  | **code + doc（实际实现）** | 8 files +198 / -46，含 mev crate 实现 + doc 增量 | ❌ **缺失，需 cherry-pick** |
+
+> 用户记忆中的"少两个 commit"是基于"基线 = `239ea48e3c`"的假设。实际 `pre-upgrade-v1.11.3.local` 标签打在 `33c11aac7`，因此 v2.2.0.local 已经包含了 `33c11aac7` 的所有内容，只需追上 `6786b11cb` 一个 commit。
+
+#### 1.4.2 方案对比与决策
+
+| 维度 | 选项 A：Cherry-pick 单 commit | 选项 B：从头重做 v2.2.0.local |
+|---|---|---|
+| 工作量 | ~15 分钟（含 cargo 三段校验） | ~4~6 小时（Sonnet 重走 Step 0~6） |
+| 是否需要 Sonnet | ❌ 不需要 | ✅ 必须重新介入 |
+| C1~C4 commit chain | ✅ 完整保留 | ❌ 整链重建 |
+| §1.3 12 维度 review 结果 | ✅ 仍然有效（仅需对 C5 加 1 轮 mini-review） | ❌ 完全失效，需重做 |
+| §2B 工单是否阻塞 | ❌ 不阻塞，照常推进 | ✅ 必须暂停等重做 |
+| 设计文档变更 | ❌ 无需修改 | ❌ 无需修改 |
+
+**决策**：选项 A。理由：
+1. `6786b11cb` 工程上 100% 隔离在 `crates/mev/` + `doc/`，0 个 glue 文件
+2. 与 C3（worker.rs 适配 `Halt {reason, gas, ..} + gas.tx_gas_used()` + `TransactionEnvMut`）**无实质冲突**，只有 1 行 import 上下文 trivial 冲突（git 三方合并可自动处理）
+3. C5 引入的依赖（`alloy_eips::eip2930::{AccessList, AccessListItem}`、`alloy_primitives::B256`、`serde_json`）在 v2.2.0 的 alloy 2.0.4 + revm 38 下全部存在
+4. revm `ResultAndState.state: HashMap<Address, Account>` 与 `Account.storage` 在 v34→v38 升级中结构稳定，C5 的 access list 收集逻辑无需再适配
+
+#### 1.4.3 Cherry-pick 执行结果
+
+```bash
+git checkout v2.2.0.local
+git cherry-pick 6786b11cb
+# → Auto-merging crates/mev/src/worker/worker.rs
+# → [v2.2.0.local 16d5228c1] 1. reth phase5. add accessList for mev_debug_traceCall
+# →  8 files changed, 198 insertions(+), 46 deletions(-)
+```
+
+✅ **0 手动冲突解决**。git 三方合并算法识别出 `use reth_evm::{..., TransactionEnvMut};` 这行虽然是 6786b11cb 原始 diff 的上下文行（未改动），但 v2.2.0 已通过 C3 把同一行从 `TransactionEnv` 改为 `TransactionEnvMut`，三方合并正确保留了 v2.2.0 的版本。
+
+**Cherry-pick 后 worker.rs 关键代码段**（自动合并产物，验证无回退）：
+
+```rust
+// crates/mev/src/worker/worker.rs
+use alloy_eips::eip2930::{AccessList, AccessListItem};   // ← C5 新增（L8）
+use alloy_primitives::B256;                               // ← C5 新增（L9）
+use alloy_primitives::map::HashSet;
+use crossbeam_channel::Receiver;
+use reth_evm::{env::BlockEnvironment, ConfigureEvm, Evm, TransactionEnvMut};  // ← C3 适配保留（L12）
+
+// ...
+
+ExecutionResult::Halt { reason, gas, .. } => {   // ← C3 适配保留（L186）
+    Err(WorkerError::Halt {
+        reason: format!("{reason:?}"),
+        gas_used: gas.tx_gas_used(),              // ← C3 适配保留（L189）
+    })
+}
+```
+
+> **Note (Cargo.lock amend)**：上面 cherry-pick 命令输出的初始 SHA 是 `68a86c2ec`，对应 8 个文件 +198/-46。随后执行 §1.4.4 的 `cargo check -p reth-mev` 时，cargo 解析到 `crates/mev/Cargo.toml` 新增的 `serde_json.workspace = true`，自动更新 `Cargo.lock` 让 `reth-mev` 的 deps 列表增加 1 行 `serde_json`（**仅 1 行变化，影响范围 = reth-mev 一个包**）。这是 C5 的合理直接副产物，因此 `git commit --amend --no-edit` 把 `Cargo.lock` 并入 C5，使其自包含。**Amend 后 C5 最终 SHA = `16d5228c1`**（共 9 个文件 +199/-46），保留原 author/date 与 subject 不变。Amend 在 push 前完成，符合 Git Safety Protocol（HEAD 是本次会话创建的、未 push 的 commit）。
+
+#### 1.4.4 Cherry-pick 后三段 cargo 校验
+
+| 命令 | 结果 | 耗时 |
+|---|---|---|
+| `cargo check -p reth-mev --color=never` | ✅ `Finished dev profile` 0 warning 0 error | 4m12s |
+| `cargo test  -p reth-mev --color=never` | ✅ **8 passed; 0 failed; 0 ignored**（与 §1.3 D8 一致） | 18s |
+| `cargo check -p reth     --color=never` | ✅ `Finished dev profile` 0 warning 0 error，`libreth_mev-*.rmeta` 成功链接 | 4m14s |
+
+8 个单测列表（全 pass）：
+
+```
+test worker::cache::tests::test_bytecodes_retained_after_reset ... ok
+test cache::tests::test_bytecode_l2_dedup                       ... ok
+test cache::tests::test_negative_cache                          ... ok
+test cache::tests::test_diff_invalidation                       ... ok
+test cache::tests::test_l2_hit_backfills_l1                     ... ok
+test cache::tests::test_three_layer_l1_priority                 ... ok
+test cache::tests::test_storage_singleflight                    ... ok
+test cache::tests::test_singleflight_concurrent_miss            ... ok
+```
+
+#### 1.4.5 C5 Mini-Review（针对 cherry-pick 的轻量 review）
+
+| 维度 | 期望 | 实测 | 结论 |
+|---|---|---|---|
+| 设计文档一致性 | C5 是 v1.11.3.local 业务 commit，与 v2.2.0 升级 scope 正交，**设计文档无需修改** | 设计文档零改动 | ✅ Pass |
+| 黑名单遵守（§4.2） | 不改 glue 文件、不引入新 glue | C5 仅改 6 个 `crates/mev/` 文件 + 2 个 doc，glue 数量保持 §6.4 的 4 个 | ✅ Pass |
+| 严禁的"修复"模式（§7.2） | 无 `#[ignore]` / `todo!()` / 私自 drop 调用 / 抹平类型差异的 wildcard | git diff 无新增违规模式 | ✅ Pass |
+| 编译 | reth-mev + reth 均 0 warning 0 error | 同 §1.4.4 | ✅ Pass |
+| 单测 | 8/8 pass，与 §1.3 D8 一致，无新增/删除单测 | 8 passed 0 failed | ✅ Pass |
+| C1~C4 适配未回退 | worker.rs 的 `TransactionEnvMut` + `Halt { ..., gas, .. }` + `gas.tx_gas_used()` 保留 | 同 §1.4.3 代码段 | ✅ Pass |
+| commit history 整洁 | C1→C2→C3→C4→C5 五个线性 commit | git log 验证通过 | ✅ Pass |
+
+**Mini-Review 结论**：✅ **Full Pass**（不引入新 Outstanding Issue）。
+
+#### 1.4.6 影响传播
+
+| 受影响位置 | 状态 |
+|---|---|
+| §1.3 12 维度 Review 结果 | ✅ 对 C1~C4 仍然有效（C5 不改 C1~C4 的任何文件） |
+| §2A 文档侧 Issue 闭环（I-001/I-002/I-004） | ✅ 不受影响（C5 不改设计文档） |
+| §2B Phase 1 binary rebuild | ⚠️ **需要包含 C5**：`git rev-parse HEAD` 期望值更新为 `16d5228c1`（或后续 push 的最新 HEAD），见 §2B.Phase 1 已同步 |
+| §2B Phase 2~4（Step 7~9） | ✅ 不受影响（仍按设计文档 §8.7/§8.8/§8.9 执行；新增 `mev_debug_traceCall` 的 `withAccessList: true` 路径可在 Phase 3 顺带验证一条用例） |
+| 设计文档 `Reth_upgrade_1.11.3_2.2.0.md` | ✅ **零改动**：C5 是纯 mev 业务功能 commit，落入设计文档「MEV 改动 ⊂ `crates/mev/`」的语义保护范围 |
+
+#### 1.4.7 §1.4 完成人 & 时间
+
+- 执行人：`Claude Opus 4.7`（cherry-pick + 三段 cargo 校验 + Mini-Review，无 Sonnet 介入）
+- 完成时间：`2026-05-13 08:30 UTC+8`
+- 新 commit：`16d5228c1`（C5）已落到 v2.2.0.local，**尚未 push**（等本 §1.4 文档更新一并 push）
+
+---
+
 ## 2. 第二轮（迭代 #2，采用方案 A：文档闭环 + DevOps 工单）
 
 > 触发条件：§1.3.4 结论为 ⚠️ Conditional Pass。
@@ -388,13 +518,16 @@ grep -n "3 个 glue\|5 个 grep\|5 处 glue" doc/Reth_upgrade_1.11.3_2.2.0.md
 
 # 工作流
 
-## Phase 1：I-005 最终 binary rebuild
+## Phase 1：I-005 最终 binary rebuild（包含 C5）
 
 1. 在测试节点 clone 仓库并 checkout v2.2.0.local 分支：
    git clone <repo-url> /opt/build/private_reth
    cd /opt/build/private_reth
    git checkout v2.2.0.local
-   git rev-parse HEAD  # 应为 ba23cfc4d（或后续 push 的最新 HEAD）
+   git rev-parse HEAD  # 应为 16d5228c1（C5 cherry-pick 完成后的 HEAD）或后续 push 的最新 HEAD
+   # 验证 C1~C5 commit chain 完整：
+   git log --oneline pre-upgrade-v1.11.3.local..HEAD
+   # 期望（自下而上）：aa491afea(C1) → 49b7cee6b(C2) → 3e6fa91f2(C3) → 68a806d47(C4) → 16d5228c1(C5)
 
 2. 清理 cache 并 rebuild：
    cargo clean
@@ -402,7 +535,7 @@ grep -n "3 个 glue\|5 个 grep\|5 处 glue" doc/Reth_upgrade_1.11.3_2.2.0.md
 
 3. 验证 binary SHA 与 HEAD 一致：
    ./target/release/reth --version
-   # Commit SHA: 应等于 git rev-parse HEAD 输出
+   # Commit SHA: 应等于 git rev-parse HEAD 输出（16d5228c1 或后续 push 的最新 HEAD）
 
 4. 把 binary 部署到测试节点的 /usr/local/bin/reth-v2.2.0.local。
 
@@ -583,7 +716,8 @@ Review 完成时间：`<待填写>`
 | 1-C1 | `aa491afea` | `feat(mev): port reth-mev crate from v1.11.3.local` | 2026-05-12 UTC+8 |
 | 1-C2 | `49b7cee6b` | `feat(mev): register reth-mev RPC module in NodeBuilder` | 2026-05-12 UTC+8 |
 | 1-C3 | `3e6fa91f2` | `fix(mev): adapt worker.rs to revm 38 and alloy-evm 0.34 API changes` *(设计要求 `adapt ExecutionResult::Halt to revm 38 field rename`，实际合并了 §5.1 + §7 R1 两项修复，body 详细列出，见 I-002)* | 2026-05-12 UTC+8 |
-| 1-C4 | `ba23cfc4d` | `docs(mev): port MEV upgrade design docs and implementation record` *(设计要求 `port MEV design docs and upgrade plan`，实际同时收录了 `_impl.md`，见 I-002)* | 2026-05-12 UTC+8 |
+| 1-C4 | `68a806d47` | `docs(mev): port MEV upgrade design docs and implementation record` *(设计要求 `port MEV design docs and upgrade plan`，实际同时收录了 `_impl.md`，见 I-002；§2A 闭环后的设计文档修订已 amend 到此 commit)* | 2026-05-13 UTC+8 |
+| 1-C5 | `16d5228c1` | `1. reth phase5. add accessList for mev_debug_traceCall` *(cherry-pick 自 v1.11.3.local @ `6786b11cb`；§1.4 v1.11.3.local 基线追平；git auto-merge 完成，0 手动冲突；保留 subject 原文以维持 v1.11.3.local 提交风格连续性)* | 2026-05-13 UTC+8 |
 | 2-C1 | `<待填写>` | `<第二轮 Issue 修复 commit>` | `<待填写>` |
 
 ### B. 性能对比数据归档（来自 Step 9）
@@ -620,4 +754,5 @@ Review 完成时间：`<待填写>`
 | §1.2.4 Compilation Fixes | 设计文档 §3 API 矩阵 + §7 风险清单 |
 | §1.3.2 D9 关键修复正确性 | 设计文档 §5.1 ExecutionResult::Halt 修复 |
 | §1.3.2 D5 / D6 兼容性 | 设计文档 §11.2 环境变量 + §11.3 metric |
+| §1.4 v1.11.3.local 基线追平 | 设计文档 §4.2 黑名单（C5 100% 落入 `crates/mev/`） + §7.2 严禁修复模式（C5 Mini-Review 维度复用） |
 | 附录 B 性能对比 | 设计文档 §8.9 / 架构文档 §8.4 |

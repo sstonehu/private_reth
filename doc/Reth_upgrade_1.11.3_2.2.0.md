@@ -894,6 +894,8 @@ grep "test result: FAILED" /tmp/mev_test_step6.log  # → 应为空
 
 ### Step 7：本地启动节点冒烟测试（30 分钟）
 
+> 📌 **测试节点适配见 §12.6**（systemd 启动、端口隔离、日志归档；本节描述的是开发机本地最小可行流程）
+
 #### 8.7.1 前置条件
 
 - Step 6 通过
@@ -988,6 +990,8 @@ grep -q "Method not found" /tmp/reth_smoketest.log && echo "FAIL: mev_eth_call n
 
 ### Step 8：链上行为对照（半天~1 天，可与 Go 侧并行）
 
+> 📌 **测试节点适配见 §12.6.3 / §12.4**（串行 v1→v2 流程、`.2B/phase3/` 归档约定、accessList 集合相等顺序可不同的规则）
+
 #### 8.8.1 前置条件
 
 - Step 7 通过
@@ -1025,6 +1029,8 @@ grep -q "Method not found" /tmp/reth_smoketest.log && echo "FAIL: mev_eth_call n
 ---
 
 ### Step 9：性能基线对齐（1 天）
+
+> 📌 **测试节点适配见 §12.5 + §12.6.4**（promql 查询模板、8 项阈值汇总、30 分钟稳定窗口）
 
 #### 8.9.1 前置条件
 
@@ -1285,21 +1291,330 @@ mev_epoch_block_delay_seconds
 
 ---
 
-## 12. 后续动作（升级完成后做）
+## 12. 测试节点验证 SOP（`v2.2.0.local` 长期分支专用）
 
-### 12.1 短期（升级完成 1 周内）
+### 12.1 章节定位
+
+本章是 §8.7 / §8.8 / §8.9（Step 7 节点冒烟 / Step 8 链上对照 / Step 9 性能基线）在**专用测试节点**上的落地适配，专为「`v2.2.0.local` 长期生产分支」的**每一次**发布前验证服务。
+
+§8.7~§8.9 描述的是「开发机本地用 `./target/release/reth node ...` 启动」的最小可行 SOP；而生产分支必须：
+- 用 **systemd** 管理（与生产 `reth.service` 结构对齐）
+- 端口与生产**严格隔离**
+- 数据落盘到约定的归档目录
+- 性能基线用 prometheus 严格采样、阈值化判定
+
+本章把上述「测试节点专属、不属于 Step 7~9 本质 SOP 的环境契约 / 模板 / 阈值」集中起来，**作为长期复用的设计资产**，由 `Reth_upgrade_1.11.3_2.2.0_impl.md §2B.2` 的 Sonnet prompt 引用与套用。
+
+适用范围：
+- ✅ 每次 `v2.2.0.local`（含后续小版本）发布前测试
+- ✅ 任何对 `crates/mev/` 的功能 / 性能影响验证
+- ❌ 一次性的本地编译验证（用 §8.7 即可，不必走测试节点）
+
+### 12.2 测试节点环境契约
+
+#### 12.2.1 硬件 / OS / Toolchain
+
+| 项 | 最低要求 |
+|---|---|
+| 磁盘 | ≥ 1.5 TB（mainnet pruned datadir ≈ 500G + build artifact + 归档数据） |
+| 内存 | ≥ 64 GB |
+| CPU | ≥ 32 vCPU |
+| OS | 与生产对齐（参考 `dt_eks_scripts/.vscode/erigon/reth.service` 部署目标） |
+| Rust toolchain | 与生产对齐（同 §11.4） |
+| reth feature flags | 与生产对齐：`asm-keccak,jemalloc,min-debug-logs,otlp,otlp-logs,default,js-tracer,keccak-cache-global`（见 `bin/reth/Cargo.toml`） |
+
+#### 12.2.2 端口约定（与生产严格隔离）
+
+| 服务 | 生产端口 | 测试节点端口 |
+|---|---|---|
+| `--http.port` | 8545 | **18545** |
+| `--ws.port` | 8546 | **18546** |
+| `--authrpc.port` | 8551 | **18551** |
+| `--metrics` | `0.0.0.0:9002` | **`0.0.0.0:19001`** |
+| `--ipcpath` | `/mnt/evm_node/reth-ipc/reth.ipc` | **`/opt/reth-test-ipc/reth.ipc`** |
+
+理由：测试节点与生产节点可能共址；端口一致会被 OS 拒绝 bind，更糟的是误向生产 JWT-authed engine API 发出请求。所有 RPC 调用 / curl / promql 抓取必须使用**测试端口**。
+
+#### 12.2.3 目录约定
+
+| 用途 | 路径 |
+|---|---|
+| 编译工作目录 | `/opt/build/private_reth` |
+| 测试 datadir（由 DevOps 提供，记为 `$TESTNET_DATADIR`） | `_impl.md §2B.3` 第 3 行备注里给出 |
+| 对照请求样本目录（记为 `$SAMPLE_DIR`） | `_impl.md §2B.3` 第 7 行备注里给出 |
+| 测试 binary（v1.11.3.local baseline） | `/usr/local/bin/reth-v1.11.3.local` |
+| 测试 binary（v2.2.0.local 新版） | `/usr/local/bin/reth-v2.2.0.local` |
+| 测试 IPC | `/opt/reth-test-ipc/reth.ipc` |
+| 数据归档根 | `/opt/build/private_reth/.2B/` |
+
+#### 12.2.4 sudoers（Sonnet 自动执行所需）
+
+DevOps 需要为 Sonnet 执行账户配置如下免密 sudo（示例账户 `ecs-user`）：
+
+```
+%ecs-user ALL=(ALL) NOPASSWD: \
+  /bin/systemctl start reth-test-v1, \
+  /bin/systemctl stop reth-test-v1, \
+  /bin/systemctl start reth-test-v2, \
+  /bin/systemctl stop reth-test-v2, \
+  /bin/cp /opt/build/private_reth/target/release/reth /usr/local/bin/reth-v2.2.0.local
+```
+
+### 12.3 systemd 服务模板
+
+#### 12.3.1 `reth-test-v1.service`（v1.11.3.local baseline）
+
+```ini
+[Unit]
+Description=RETH (test, v1.11.3.local baseline)
+After=network.target
+StartLimitIntervalSec=0
+Conflicts=reth-test-v2.service
+
+[Service]
+User=ecs-user
+Group=ecs-user
+Type=simple
+Restart=on-failure
+RestartSec=5s
+Nice=-20
+Environment=N=108000
+Environment=MEV_WORKER_COUNT=60
+Environment=MEV_GLOBAL_CACHE_MAX_MB=16384
+Environment=TOKIO_WORKER_THREADS=24
+Environment=RAYON_NUM_THREADS=16
+ExecStart=/usr/local/bin/reth-v1.11.3.local node \
+  --minimal \
+  --prune.receipts.distance $N \
+  --prune.bodies.distance $N \
+  --prune.account-history.distance $N \
+  --prune.storage-history.distance $N \
+  --prune.transaction-lookup.distance $N \
+  --rpc.max-blocking-io-requests 64 \
+  --rpc.max-tracing-requests 64 \
+  --metrics 0.0.0.0:19001 \
+  --datadir <TESTNET_DATADIR> \
+  --authrpc.jwtsecret <TESTNET_DATADIR>/jwt.hex \
+  --authrpc.addr 127.0.0.1 \
+  --authrpc.port 18551 \
+  --http \
+  --http.addr 127.0.0.1 \
+  --http.port 18545 \
+  --ws \
+  --ws.addr 127.0.0.1 \
+  --ws.port 18546 \
+  --rpc-max-connections 429496729 \
+  --http.api trace,web3,eth,debug,mev \
+  --ws.api trace,web3,eth,debug,mev \
+  --log.file.directory /opt/build/private_reth/.2B/reth-v1-logs \
+  --rpc.max-request-size 64 \
+  --ipcpath /opt/reth-test-ipc/reth.ipc
+
+CPUAffinity=1-31,65-95
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 12.3.2 `reth-test-v2.service`（v2.2.0.local 新版）
+
+与 `reth-test-v1.service` **完全相同**，仅以下 4 处不同：
+
+```diff
+- Description=RETH (test, v1.11.3.local baseline)
++ Description=RETH (test, v2.2.0.local)
+
+- Conflicts=reth-test-v2.service
++ Conflicts=reth-test-v1.service
+
+- ExecStart=/usr/local/bin/reth-v1.11.3.local node \
++ ExecStart=/usr/local/bin/reth-v2.2.0.local node \
+
+- --log.file.directory /opt/build/private_reth/.2B/reth-v1-logs \
++ --log.file.directory /opt/build/private_reth/.2B/reth-v2-logs \
+```
+
+**v2.2.0 CLI 兼容性注解**（与 https://reth.rs/cli/reth/node 及 `crates/node/core/src/args` 源码核对结果）：
+- `--rpc-max-connections` 在 v2.2.0 仍作为 alias 保留（主名 `--rpc.max-connections`；见 `crates/node/core/src/args/rpc_server.rs`）。**模板可直接复用生产写法**
+- `--minimal` / `--prune.*.distance` / `--rpc.max-blocking-io-requests` / `--rpc.max-tracing-requests` / `--http.api` / `--ws.api` / `--log.file.directory` / `--ipcpath` 在 v2.2.0 全部**无变化**
+- `mev` 命名空间在 v2.2.0 上游 `RethRpcModule` 枚举中**内建**（`crates/rpc/rpc-server-types/src/module.rs`），无需额外白名单
+- `--storage.v2` 默认 `true`，但仅影响**新建** db；测试 datadir 来自 v1.11.3 datadir 复制时**不触发** v2 layout，**保持默认即可**
+
+#### 12.3.3 共用前置目录（DevOps 一次性创建）
+
+```bash
+sudo mkdir -p /opt/reth-test-ipc
+sudo chown ecs-user:ecs-user /opt/reth-test-ipc
+sudo mkdir -p /opt/build/private_reth/.2B/{phase1,phase2,phase3,phase4,reth-v1-logs,reth-v2-logs}
+sudo chown -R ecs-user:ecs-user /opt/build/private_reth/.2B
+```
+
+### 12.4 数据归档目录约定
+
+所有 Phase 产物落到 `/opt/build/private_reth/.2B/`，目录结构如下：
+
+```
+.2B/
+├── phase1/                                       # Phase 1: binary rebuild
+│   ├── build_<ts>.log                            # cargo build --release 输出
+│   └── version.txt                               # reth --version（含 Commit SHA）
+├── phase2/                                       # Phase 2: 节点冒烟
+│   └── smoketest_<ts>.log                        # journalctl 节选（30s 启动日志）
+├── phase3/                                       # Phase 3: 链上对照
+│   ├── v1_eth_call_<ts>.jsonl                    # v1 baseline 响应（一行一 JSON）
+│   ├── v2_eth_call_<ts>.jsonl                    # v2 响应
+│   ├── v1_debug_traceCall_<ts>.jsonl
+│   ├── v2_debug_traceCall_<ts>.jsonl
+│   ├── v1_trace_call_<ts>.jsonl
+│   ├── v2_trace_call_<ts>.jsonl
+│   ├── v1_subscribe_<ts>.jsonl                   # 5 个区块的 mev_subscribe 推送
+│   ├── v2_subscribe_<ts>.jsonl
+│   ├── diff_eth_call.txt                         # 4 个 method 的 diff 报告
+│   ├── diff_debug_traceCall.txt
+│   ├── diff_trace_call.txt
+│   └── diff_subscribe.txt
+├── phase4/                                       # Phase 4: 性能基线
+│   ├── v1_{eth_call_p99,debug_p99,trace_p99,l1_hit_rate,db_reads_per_min,warmup_p99,block_delay_p99}_<ts>.json
+│   └── v2_{...同上...}_<ts>.json
+├── reth-v1-logs/                                 # systemd log.file.directory（v1）
+└── reth-v2-logs/                                 # systemd log.file.directory（v2）
+```
+
+文件命名规范：
+- `<ts>` = `$(date +%s)` epoch 秒（便于按时间排序，避免同名覆盖）
+- `.jsonl` = 一行一个 JSON 对象（与 `jq -c '.'` 风格一致，便于 `diff <(jq -S .) <(jq -S .)` 对照）
+- `.json` = 单个 JSON 对象（promql 查询响应）
+- `diff_*.txt` = 人类可读 diff 报告（`diff -u` 或 `jq` 集合对比）
+
+### 12.5 性能基线 promql 查询模板
+
+所有查询打到测试节点的 prometheus（端口 19001）。指标名出处见 §11.3。
+
+```bash
+# A. method 维度 P99（method ∈ {eth_call, debug_traceCall, trace_call}）
+#    稳态用 [5m]、首批用 [30s]
+curl -sG http://localhost:19001/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.99, sum(rate(mev_e2e_duration_seconds_bucket{method="eth_call"}[5m])) by (le))'
+
+# B. L1 命中率（Δ ≤ -1pp 视为退化）
+curl -sG http://localhost:19001/api/v1/query --data-urlencode \
+  'query=rate(mev_worker_l1_hits_total[5m])/(rate(mev_worker_l1_hits_total[5m])+rate(mev_worker_l1_misses_total[5m]))'
+
+# C. db_reads 每分钟增量（Δ ≤ +30% 视为可接受）
+curl -sG http://localhost:19001/api/v1/query --data-urlencode \
+  'query=rate(mev_global_cache_db_reads_total[1m])*60'
+
+# D. epoch warmup P99（首批冷启动；Δ ≤ +20%）
+curl -sG http://localhost:19001/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.99, sum(rate(mev_epoch_warmup_duration_seconds_bucket[5m])) by (le))'
+
+# E. epoch block_delay P99（Δ ≤ +10%）
+curl -sG http://localhost:19001/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.99, sum(rate(mev_epoch_block_delay_seconds_bucket[5m])) by (le))'
+```
+
+窗口选择规则：
+- **首批 P99** = 节点启动后 5 分钟内：`rate(...[30s])`
+- **稳态 P99** = 节点稳定 30 分钟后：`rate(...[5m])`
+
+### 12.6 Phase 1~4 阈值汇总
+
+#### 12.6.1 Phase 1 阈值
+
+| # | 项 | 阈值 |
+|---|---|---|
+| 1 | C1~C5 commit chain 完整 | 5 个 commit 全部在 `pre-upgrade-v1.11.3.local..HEAD` 之间 |
+| 2 | `cargo build -p reth --release` | 0 warning 0 error |
+| 3 | `reth --version` 的 `Commit SHA` 前 8 位 | == `git rev-parse HEAD` 前 8 位 |
+
+#### 12.6.2 Phase 2 阈值（同 §8.7.3）
+
+| # | 项 | 阈值 |
+|---|---|---|
+| 1 | `mev RPC module installed` 日志 | 出现 1 次 |
+| 2 | `EpochManager starting` 日志 | 出现 1 次 |
+| 3 | `registered impact handler` 日志 | 出现 **6** 次（6 个 handler） |
+| 4 | `Method not found` 日志 | 0 次 |
+| 5 | `eth_chainId` / `eth_blockNumber` HTTP 18545 | 返回正常 |
+
+#### 12.6.3 Phase 3 阈值（同 §8.8.3）
+
+| # | method | 阈值 |
+|---|---|---|
+| 1 | `eth_call` | result bytes 100% 一致 |
+| 2 | `debug_traceCall`（含 `with_access_list`） | gasUsed + output 100% 一致；accessList **集合相等但顺序可不同**（§1.4.5） |
+| 3 | `trace_call` | output + gasUsed 100% 一致 |
+| 4 | `mev_subscribe` | block_number / hash / timestamp + changed_raw_ids **集合相等** |
+| 5 | `-39001.data.gap`（如样本涉及） | 100% 一致 |
+
+#### 12.6.4 Phase 4 阈值（同 §8.9.3，**8 项全部满足才 Pass**）
+
+| # | 指标 | 阈值 | promql |
+|---|---|---|---|
+| 1 | `mev_e2e_duration{eth_call}` 稳态 P99 | Δ ≤ +10% | A（[5m]） |
+| 2 | `mev_e2e_duration{eth_call}` 首批 P99 | Δ ≤ +20% | A（[30s]） |
+| 3 | `mev_e2e_duration{debug_traceCall}` P99 | Δ ≤ +10% | A（[5m]） |
+| 4 | `mev_e2e_duration{trace_call}` P99 | Δ ≤ +10% | A（[5m]） |
+| 5 | `mev_global_cache_db_reads_total` /min | Δ ≤ +30% | C |
+| 6 | `mev_worker_l1_hits/(hits+misses)` | ≥ baseline − 1pp | B |
+| 7 | `mev_epoch_warmup_duration` P99 | Δ ≤ +20% | D |
+| 8 | `mev_epoch_block_delay` P99 | Δ ≤ +10% | E |
+
+任一项越线 → 按 §8.9.4 应对（**严禁**用 §7.2 列出的"修复"模式）。
+
+### 12.7 与生产 `reth.service` 的兼容性核查
+
+下表是测试节点 systemd 模板（§12.3）相对生产 `dt_eks_scripts/.vscode/erigon/reth.service` 的差异。**本节同时是「生产 `reth.service` 在 v2.2.0 下是否需要修订」的依据**。
+
+| 项 | 生产 | 测试节点 | 原因 | v2.2.0 兼容性 |
+|---|---|---|---|---|
+| binary 路径 | `/usr/local/bin/reth` | `/usr/local/bin/reth-v{1,2}` | 串行切换 v1/v2 | — |
+| datadir | `/mnt/evm_node/reth_data/` | `$TESTNET_DATADIR` | 生产隔离 | — |
+| jwt | `/mnt/evm_node/jwt.hex` | `$TESTNET_DATADIR/jwt.hex` | 跟随 datadir | — |
+| ipc | `/mnt/evm_node/reth-ipc/reth.ipc` | `/opt/reth-test-ipc/reth.ipc` | 生产隔离 | ✅ `--ipcpath` 无变化 |
+| http/ws/authrpc port | 8545/8546/8551 | 18545/18546/18551 | 端口隔离 | ✅ 无变化 |
+| metrics port | 9002 | 19001 | 端口隔离 | ✅ 无变化 |
+| log.file.directory | `/dt-logs/log/reth` | `.2B/reth-v{1,2}-logs` | 测试归档 | ✅ 无变化 |
+| `--http.addr` | `0.0.0.0` | `127.0.0.1` | 测试不暴露外网 | ✅ 无变化 |
+| `--ws.addr` | `0.0.0.0` | `127.0.0.1` | 测试不暴露外网 | ✅ 无变化 |
+| `--rpc-max-connections` | `429496729` | 同 | — | ⚠️ 仍保留为 alias（主名 `--rpc.max-connections`）；**生产可继续用旧写法**，建议在下一次维护窗口顺手升级为新写法 |
+| `--http.api` / `--ws.api` | `trace,web3,eth,debug,mev` | 同 | — | ✅ `mev` 上游内建（v2.2.0） |
+| `--minimal` / `--prune.*.distance` | 启用 | 同 | — | ✅ 无变化 |
+| `--rpc.max-blocking-io-requests 64` | 启用 | 同 | — | ✅ 无变化 |
+| `--rpc.max-tracing-requests 64` | 启用 | 同 | — | ✅ 无变化 |
+| `--rpc.max-request-size 64` | 启用 | 同 | — | ✅ 无变化 |
+| `MEV_WORKER_COUNT` env | 60 | 60（Phase 4）/ 8（Phase 2 冒烟） | Phase 2 不需要生产并发 | — |
+| `MEV_GLOBAL_CACHE_MAX_MB` env | 16384 | 16384（Phase 4）/ 1024（Phase 2 冒烟） | 同上 | — |
+
+**结论**：
+
+- 生产 `reth.service` 在 v2.2.0.local 下**零 CLI 改动即可直接运行**
+- 唯一**可选**改进：把 `--rpc-max-connections` 升级为 `--rpc.max-connections`（风格统一，无功能影响），可在下一次例行维护窗口顺手做
+- §13.1 中关于"`reth.service` 的 reth 版本字符串"的工单**仍然成立**（仅是部署元信息更新，与 CLI 无关）
+
+### 12.8 章节交叉索引
+
+| 调用方 | 调用本章的位置 | 用途 |
+|---|---|---|
+| `_impl.md §2B.2` Sonnet prompt | 「唯一信息源」段引用 §12 | Sonnet 套用本章的端口 / systemd / 归档 / 阈值 / promql |
+| `_impl.md §2B.3` DevOps checklist | 检查项对照 §12.2 / §12.3 / §12.3.3 | DevOps 按本章准备测试节点 |
+| 本设计文档 §8.7 / §8.8 / §8.9 | 章节末尾 "测试节点适配见 §12" 提示 | 把测试节点专属内容定向到本章 |
+
+## 13. 后续动作（升级完成后做）
+
+### 13.1 短期（升级完成 1 周内）
 
 - 更新 `dt_eks_scripts/.vscode/erigon/reth.service` 中的 reth 版本字符串（若有硬编码）
 - 更新内部 Wiki / 部署文档中提及 `v1.11.3.local` 的位置
 - 通知 Go 侧（dural_trade / go-service）一线开发者升级已完成，可继续在 v2.2.0.local 上做后续 MEV 改动
 
-### 12.2 中期（升级完成 1 月内）
+### 13.2 中期（升级完成 1 月内）
 
 - 验证生产环境跑 7 天，确认无 OOM / panic / 性能退化
 - 把 `Reth_simulate_optimize_phase{1..5}.md` 中对 reth 内部代码路径的引用刷新到 v2.2.0 行号
 - 评估是否合适开 Phase 6（如 `mev_callBatch` / `mev_callBundleBatch`，见架构文档 §7.3 待规划项）
 
-### 12.3 长期
+### 13.3 长期
 
 - 跟随 reth 上游持续合并安全补丁（小版本）
 - 当 alloy → 3.0 / revm → 40+ 等下一波 major 升级到来时，本文档可作为参考模板

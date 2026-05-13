@@ -6,7 +6,7 @@
 > Review Agent：Claude Opus 4.7
 > 文档负责人：`<填写>`
 > 创建日期：2026-05-12
-> 最后更新：2026-05-13 08:30 UTC+8（§1.4 完成 C5 cherry-pick & 三段 cargo 校验）
+> 最后更新：2026-05-13 09:00 UTC+8（§2B.2 重写为交付 Sonnet 4.6 的 prompt；§2B.3 升级 DevOps/Sonnet 职责边界）
 
 ---
 
@@ -478,141 +478,412 @@ grep -n "3 个 glue\|5 个 grep\|5 处 glue" doc/Reth_upgrade_1.11.3_2.2.0.md
 转录人：`Claude Opus 4.7`
 转录完成时间：`2026-05-13 01:00 UTC+8`
 
-#### 2B.2 DevOps 工单 Prompt
+#### 2B.2 交付 Sonnet 4.6 的 Prompt（投入实施前最终版）
 
-> **目标读者**：DevOps 工程师（人类）+ 协助分析的 AI（Sonnet 4.6 / Opus 4.7）
-> **环境要求**：可独占使用的测试节点（非生产 reth），mainnet datadir 同步至最新，磁盘 ≥ 1.5T，内存 ≥ 64G，CPU ≥ 32 vCPU
-> **关键约束**：**不要碰生产 datadir `/mnt/evm_node/reth_data/`**
+> **目标读者**：Claude Sonnet 4.6（执行 Agent，自主完成 Phase 1~4 + 进度回写）
+> **使用方式**：把下方 ````text 框内的整块文本作为唯一一条 user message 发给 Sonnet 4.6，**不要做任何节选**。Sonnet 启动后会自主 verify §2B.3 是否就绪、按 Phase 1→2→3→4 串行执行、并实时回写 §2B.4 / §2B.5。
+> **环境要求**：测试节点（非生产）、独立 datadir、磁盘 ≥ 1.5T / 内存 ≥ 64G / CPU ≥ 32 vCPU、prometheus 19001 端口在测试节点可达、systemd 服务模板就位、对照请求样本就绪 —— **全部由 DevOps 在 §2B.3 中预先准备并标记 ✅**。
+> **关键硬约束**：Sonnet 启动后**第一件事是 verify §2B.3 全部 ✅**；任一项 ⬜/未填，Sonnet 必须立即停下来在 §2B.5 创建 I-NEW-XXX 并通知人类，**不允许自己尝试 setup**。
 
-下方框内是 DevOps 工单完整可粘贴文本：
+下方框内是交付 Sonnet 4.6 的完整可粘贴 prompt：
 
 ````text
 # 任务
 
-针对第一轮 reth 升级 review 中的 I-003（Step 7~9 验证）+ I-005（binary rebuild），
-在**测试节点**上完整跑完链上行为对照 + 性能基线对齐，并补做最终二进制 rebuild。
+接续 reth `v1.11.3.local → v2.2.0.local` 升级第一轮 review 留下的 §2B 工单：
+在**测试节点**（不是生产节点）上完成
+  - I-005 最终 binary rebuild（Phase 1）
+  - I-003 Step 7 本地节点冒烟（Phase 2，依据设计文档 §8.7）
+  - I-003 Step 8 链上行为对照（Phase 3，依据设计文档 §8.8）
+  - I-003 Step 9 性能基线对齐（Phase 4，依据设计文档 §8.9）
+
+把全部执行过程与数据按格式回写到实施记录 §2B.4（4 个 Phase 表）+ 附录 B（性能指标）。
+完成后由 Opus 4.7 在 §2B.6 复审、签收整个升级。**§2B.6 不是你的工作**。
 
 # 唯一信息源
 
-- 设计文档：/home/ecs-user/dt_workspace/private_reth/doc/Reth_upgrade_1.11.3_2.2.0.md
-- 实施记录：/home/ecs-user/dt_workspace/private_reth/doc/Reth_upgrade_1.11.3_2.2.0_impl.md
-- v2.2.0.local 分支：已 push 到 origin，含 4 个 atomic commit + Opus 修订后的设计文档（§4.1 / §6.2 / §6.4 / §8.3 / §8.10 / §9.4 / §11.5）
+- **设计文档**：/home/ecs-user/dt_workspace/private_reth/doc/Reth_upgrade_1.11.3_2.2.0.md
+  - §8.7.1~4  → Phase 2 SOP（启动命令、期望日志、验收命令、失败应对）
+  - §8.8.1~4  → Phase 3 SOP（样本规模、对照项、差异判定、失败应对）
+  - §8.9.1~4  → Phase 4 SOP（基线方法、指标清单、阈值、失败应对）
+  - §7.2      → 严禁的"修复"模式（同样适用于此工单）
+  - §11.2     → 运行时 MEV_* 环境变量清单
+  - §11.3     → Prometheus 指标清单
 
-# 前置准备（人类侧）
+- **实施记录**：/home/ecs-user/dt_workspace/private_reth/doc/Reth_upgrade_1.11.3_2.2.0_impl.md
+  - §1.3 + §1.4 → 第一轮已完成（含 C5 cherry-pick）的上下文，**只读**
+  - §2A          → 文档闭环已完成，**只读**
+  - §2B.1        → 你要处理的 Issue 清单（I-003 High + I-005 Medium）
+  - §2B.3        → 你启动前必须逐项 verify ✅ 的前置 checklist
+  - §2B.4        → 你的进度回写位置（4 个 Phase 表 + 数据归档路径）
+  - §2B.5        → 你发现的新 Issue 登记位置（I-NEW-NNN）
+  - §2B.6        → Opus 4.7 复审，**不是你的工作**
+  - 附录 B       → 你要填的性能对比表
 
-1. 确认有一台可独占测试节点：
-   - 不与生产 reth 共用 datadir（即另一个挂载点）
-   - 磁盘 ≥ 1.5T（mainnet pruned datadir ≈ 500G，留 build artifacts + log + margin）
-   - 节点 OS、Rust toolchain、reth feature flags 与生产环境一致（参考
-     `dt_eks_scripts/.vscode/erigon/reth.service`）
+- **v2.2.0.local 分支**：origin/v2.2.0.local，HEAD ≥ `f6f15213c`（§1.4 doc commit）
+  C1~C5 commit chain（自下而上）：
+  `aa491afea(C1) → 49b7cee6b(C2) → 3e6fa91f2(C3) → 68a806d47(C4) → 16d5228c1(C5)`
 
-2. 准备 mainnet datadir（任选其一）：
-   - 选项 A（推荐）：用 reth snapshot 工具下载 paradigm 官方 snapshot，加速到最新链头
-   - 选项 B：从 0 同步 mainnet（~5-7 天）
-   - 选项 C：从生产节点做一次离线 datadir 冷拷贝（需 8~12 小时业务停摆，**不推荐**）
+- **生产 systemd 服务参考**（仅读取参数清单，**不要触碰生产服务本身**）：
+  /home/ecs-user/dt_workspace/dt_eks_scripts/.vscode/erigon/reth.service
+  → MEV_WORKER_COUNT / MEV_GLOBAL_CACHE_MAX_MB / TOKIO_WORKER_THREADS / RAYON_NUM_THREADS
 
-3. 同步生产环境用的 v1.11.3.local 二进制（已在生产节点 /usr/local/bin/reth），
-   传输到测试节点保存为 /usr/local/bin/reth-v1.11.3.local。
+# 角色与执行环境
 
-4. 部署 v2.2.0.local 二进制（步骤详见 Phase 1）。
+- 你是 Claude Sonnet 4.6
+- 你在**测试节点**本地运行（或 DevOps 已为你配好 SSH，命令可直达测试节点）
+- 你的工作目录：测试节点上的 `/opt/build/private_reth`
+  - 不存在则 Phase 1 第一步 `git clone <repo-url> /opt/build/private_reth`
+- 你的进度回写文件：测试节点上的 `/opt/build/private_reth/doc/Reth_upgrade_1.11.3_2.2.0_impl.md`
+  - 每完成 1 个 Phase 立即写 + commit + push（详见「进度回写规则」）
+- 你的 raw 数据归档目录：测试节点上的 `/opt/build/private_reth/.2B/<phase>/<timestamp>.{log,json,csv,jsonl}`
+  - **不要把 raw 数据塞进 _impl.md**，只在 §2B.4 表格里贴绝对路径
+- 你**不需要**也**不允许**触碰任何生产资源
+
+# 强制约束（违反任意一项都视为 §2B 失败 → 触发 §3 第三轮）
+
+1. **禁止碰生产**。任何对以下路径或服务的读/写都视为重大违规：
+   - `/mnt/evm_node/reth_data/`（生产 datadir）
+   - `/mnt/evm_node/reth-ipc/`（生产 IPC socket）
+   - `/mnt/evm_node/jwt.hex`（生产 JWT）
+   - systemd 单元 `reth.service`（生产服务）
+   - 生产节点上的 `dural_trade` / `go-service` 进程
+   一旦发现自己即将访问上述任一项，立即终止当前步骤，§2B.5 创建 I-NEW-XXX 报告。
+
+2. **禁止修改 v2.2.0.local 分支的源代码**。如发现 bug 必须：
+   - 不做任何代码改动（包括 `// TODO`、`#[ignore]`、commented-out code）
+   - §2B.5 创建 I-NEW-XXX，附完整堆栈或差异 JSON
+   - 停下来等 Opus 4.7 / 人类决议
+   - 严禁"先打个补丁继续"。
+
+3. **§7.2 严禁的"修复"模式同样适用**：
+   - 禁止 `#[ignore]` 单测
+   - 禁止 `todo!()` / `unimplemented!()`
+   - 禁止"少量差异可接受" / "约 X ms" / "大致符合" / "等下次再补"
+   - 禁止跳过 §8.8 中的任何请求类型（如 "trace_call 样本不好凑就只跑 10 笔"）
+   - **Phase 3 差异条数必须 = 0**；**Phase 4 八项指标必须全部 ≤ 阈值**
+
+4. **顺序约束**：Phase 1 ✗ → 不能开始 Phase 2；Phase 2 ✗ → 不能开始 Phase 3；
+   依此类推。任一 Phase 失败立即在 §2B.5 写完详情，**停下来**等人类介入。
+
+5. **回写必须实时**：每完成 1 个 Phase 立即更新 §2B.4 对应表格 + commit + push。
+   严禁批量回写。Phase 中途遇到任何非预期，立即写到 §2B.5（哪怕你后续解决了），
+   保留全部过程证据。
+
+6. **指标 / 日志必须有原始证据**：
+   - 日志类：贴 `grep` 命令 + `grep` 输出（例：`grep -c "registered impact handler" /tmp/reth_smoketest.log`）
+   - 指标类：贴 `promql` 查询 + `curl` 调用 + 完整 JSON 输出路径（归档到 `.2B/<phase>/`）
+   - **严禁**人工估算、目测、四舍五入到整数。
+
+7. **禁止跨仓库 / 跨节点副作用**：
+   - 不要 push 任何分支到 v2.2.0.local 之外的 ref
+   - 不要触发 dural_trade / go-service / private_reth/main 的 build / test
+   - 不要修改测试节点外的任何文件
+
+# 启动 Checklist（你的第一件事，逐项 verify）
+
+在执行 Phase 1 之前，先 verify §2B.3 全部 ✅。逐条执行以下命令，把每条的实际结果
+贴到 §2B.3 对应行的「备注」列，并把 ⬜ 改为 ✅ 或 ❌：
+
+```bash
+# 1) 测试节点硬件
+df -h /opt /var/lib/reth 2>/dev/null || df -h /opt
+free -g
+nproc
+# 期望：磁盘 ≥ 1.5T、内存 ≥ 64G、CPU ≥ 32
+
+# 2) testnet datadir 状态（路径由 DevOps 在 §2B.3 行 3 备注里给出，记为 $TESTNET_DATADIR）
+ls -lah "$TESTNET_DATADIR/db/mdbx.dat"
+# 启动 v1 30 秒看 eth_blockNumber，期望接近当前链头（差 ≤ 1000 块）
+
+# 3) v1.11.3.local binary 就位
+/usr/local/bin/reth-v1.11.3.local --version
+# 期望：包含 "Commit SHA: 6786b11c..." 或 v1.11.3.local 任一已知 HEAD SHA
+
+# 4) systemd 服务模板就位（与生产 reth.service 结构对齐，差异仅 datadir/binary path/port）
+ls /etc/systemd/system/reth-test-v1.service /etc/systemd/system/reth-test-v2.service
+# 端口约定（避开生产 8545/8546/8551/9001/9002）：
+#   --http.port 18545 / --ws.port 18546 / --authrpc.port 18551
+#   --metrics 0.0.0.0:19001
+#   --ipcpath /opt/reth-test-ipc/reth.ipc
+
+# 5) prometheus 端点
+curl -fsS http://localhost:19001/metrics | head -5
+# 期望：返回以 # HELP 开头的若干行
+
+# 6) 链上对照样本（路径由 DevOps 在 §2B.3 行 7 备注里给出，记为 $SAMPLE_DIR）
+ls -lah "$SAMPLE_DIR"/{eth_call,debug_traceCall,trace_call}.jsonl
+wc -l "$SAMPLE_DIR"/*.jsonl
+# 期望：3 个文件均存在；行数 ≥ 100 / 50 / 20（与 §8.8.2 下限对齐）
+```
+
+**任一项 ✗ → 立即停下来在 §2B.5 创建 I-NEW-XXX，描述具体缺失项，等待 DevOps 补齐**，
+**不要自己尝试 setup**（如自己 wget snapshot、自己造样本——这都是 DevOps 工作）。
 
 # 工作流
 
 ## Phase 1：I-005 最终 binary rebuild（包含 C5）
 
-1. 在测试节点 clone 仓库并 checkout v2.2.0.local 分支：
-   git clone <repo-url> /opt/build/private_reth
-   cd /opt/build/private_reth
-   git checkout v2.2.0.local
-   git rev-parse HEAD  # 应为 16d5228c1（C5 cherry-pick 完成后的 HEAD）或后续 push 的最新 HEAD
-   # 验证 C1~C5 commit chain 完整：
-   git log --oneline pre-upgrade-v1.11.3.local..HEAD
-   # 期望（自下而上）：aa491afea(C1) → 49b7cee6b(C2) → 3e6fa91f2(C3) → 68a806d47(C4) → 16d5228c1(C5)
+操作清单：
 
-2. 清理 cache 并 rebuild：
-   cargo clean
-   cargo build -p reth --release --color=never 2>&1 | tee /tmp/final_build.log
+```bash
+# 1) clone / checkout
+test -d /opt/build/private_reth || git clone <repo-url> /opt/build/private_reth
+cd /opt/build/private_reth
+git fetch origin
+git checkout v2.2.0.local
+git reset --hard origin/v2.2.0.local
+git rev-parse HEAD              # 期望 ≥ f6f15213c
 
-3. 验证 binary SHA 与 HEAD 一致：
-   ./target/release/reth --version
-   # Commit SHA: 应等于 git rev-parse HEAD 输出（16d5228c1 或后续 push 的最新 HEAD）
+# 2) C1~C5 chain 完整性
+git log --oneline pre-upgrade-v1.11.3.local..HEAD
+# 期望（自下而上 5+ 行，f6f15213c 是 doc commit、可有可无）：
+#   aa491afea(C1) → 49b7cee6b(C2) → 3e6fa91f2(C3) → 68a806d47(C4) → 16d5228c1(C5) [→ f6f15213c(docs)]
 
-4. 把 binary 部署到测试节点的 /usr/local/bin/reth-v2.2.0.local。
+# 3) rebuild
+mkdir -p .2B/phase1
+cargo clean
+time cargo build -p reth --release --color=never 2>&1 | tee .2B/phase1/build_$(date +%s).log
 
-5. 在 §2B.4 「Phase 1」表填写：最终 binary SHA / build feature flags / build 耗时。
+# 4) binary SHA 与 HEAD 一致
+./target/release/reth --version | tee .2B/phase1/version.txt
+# Commit SHA: 必须等于 git rev-parse HEAD（前 8~10 位即可）
 
-## Phase 2：I-003 Step 7（本地节点冒烟）
+# 5) 部署
+sudo cp ./target/release/reth /usr/local/bin/reth-v2.2.0.local
+ls -lah /usr/local/bin/reth-v2.2.0.local
+```
 
-按设计文档 §8.7 完整执行。
+回写 §2B.4 「Phase 1」表 7 字段（开始/完成时间、HEAD SHA、cargo exit + warning 数、
+build 耗时、`reth --version` SHA、部署路径）。
 
-预期日志：30 秒内出现 `mev RPC module installed` + 6 条 `registered impact handler`。
-预期 mev_eth_call 测试：不报 `Method not found`，返回正常 hex 或合理 revert。
+**通过条件**：`reth --version` 显示的 SHA == `git rev-parse HEAD` 前 8 位；cargo 0 warning 0 error。
 
-在 §2B.4 「Phase 2」段填写：启动命令 / 启动日志关键 4 行 / mev_eth_call 测试结果 /
-30 秒内有无 panic / OOM。
+成功 → 进入 Phase 2。失败 → §2B.5 + 停。
 
-## Phase 3：I-003 Step 8（链上行为对照）
+## Phase 2：I-003 Step 7 节点冒烟
 
-按设计文档 §8.8 完整执行：在同一台测试节点上**先**用 v1.11.3.local 跑同一组请求得到
-baseline，**再**切换到 v2.2.0.local 跑同一组请求做对照。
+完全按设计文档 §8.7.2 操作 + §8.7.3 验收。
 
-样本规模：
-- 100~1000 笔 mev_eth_call（覆盖 5~10 条 dex 路径）
-- 50~100 笔 mev_debug_traceCall（含 withAccessList: true）
-- 20~50 笔 mev_trace_call
-- 1 个 mev_subscribe("newBlockRawIds") 长连接，记录 5 个区块的推送
+测试节点专属适配：
+- datadir：`$TESTNET_DATADIR`（来自 §2B.3 行 3）
+- 端口：`--http.port 18545 --ws.port 18546 --authrpc.port 18551 --metrics 0.0.0.0:19001`
+- 启动方式：`sudo systemctl start reth-test-v2`（启动前确认 v1 已 stop）
+- 环境变量：参考生产 `reth.service`，冒烟测试用 `MEV_WORKER_COUNT=8 MEV_GLOBAL_CACHE_MAX_MB=1024`
+- 日志：`journalctl -u reth-test-v2 -f --since "30 sec ago"` 或 `journalctl -u reth-test-v2 --no-pager -n 200 > .2B/phase2/smoketest_$(date +%s).log`
 
-对照标准见设计文档 §8.8.3。
+回写 §2B.4 「Phase 2」表 9 字段：
+- 启动命令（含所有 `MEV_*` env 值）
+- `mev RPC module installed` 日志原文（贴一整行）
+- `EpochManager starting` 日志原文
+- 6 行 impact handler 注册日志（用 `grep -c "registered impact handler"` 必须 = 6）
+- `mev_eth_call` 测试响应（贴 curl 命令 + JSON 响应）
+- 30 秒内有无 panic / OOM（用 `grep -E "panic|out of memory|abort" $LOG`）
+- 验收结果 ✅/❌
 
-在 §2B.4 「Phase 3」表填写：各类型请求样本数 + 差异条数（必须 0 不一致）。
-若有差异，详细列出请求 / v1 响应 / v2 响应（不允许"少量差异可接受"——必须查明根因）。
+**通过条件**：§8.7.3 全部 4 项验收命令均输出 `OK`，无 `Method not found`，
+节点 30 秒内不 panic / OOM / 退出。
 
-## Phase 4：I-003 Step 9（性能基线对齐）
+成功 → 进入 Phase 3。失败 → 按 §8.7.4 失败应对（**仅诊断，不改源码**）+ §2B.5 + 停。
 
-按设计文档 §8.9 完整执行。
+## Phase 3：I-003 Step 8 链上行为对照
 
-需收集的 8 个指标见 §2B.4 「Phase 4」表。
+完全按设计文档 §8.8.2 + §8.8.3 操作。
 
-在 §2B.4 「Phase 4」表填写：把 8 个指标的 v1/v2 对比数据填到附录 B，
-计算稳态 P99 退化百分比 + 首批 P99 退化百分比 + db_reads 增长百分比，
-与设计文档 §8.9.3 阈值（稳态 P99 ≤ 10% / 首批 P99 ≤ 20% / db_reads ≤ 30%）对比。
+测试节点专属适配（同一台节点串行，不能并行）：
 
-# 报告格式
+```bash
+mkdir -p .2B/phase3
 
-每完成 1 个 Phase 立即追加到 §2B.4。
-所有指标数据**必须**附 grafana 截图或 prometheus 查询命令，不允许只写"约 X ms"。
+# 1) 先用 v1.11.3.local 跑全部样本
+sudo systemctl stop reth-test-v2 2>/dev/null
+sudo systemctl start reth-test-v1   # binary 指向 /usr/local/bin/reth-v1.11.3.local
+sleep 60   # 节点稳定 + 同步到链头
+for method in eth_call debug_traceCall trace_call; do
+  jq -c '.' "$SAMPLE_DIR/$method.jsonl" | while read req; do
+    curl -s http://localhost:18545 -H 'Content-Type: application/json' -d "$req"
+  done > .2B/phase3/v1_${method}_$(date +%s).jsonl
+done
 
-# 强制约束
+# 2) 切到 v2.2.0.local
+sudo systemctl stop reth-test-v1
+sudo systemctl start reth-test-v2
+sleep 60
+# 用同一份样本再跑一遍，输出到 .2B/phase3/v2_${method}_<ts>.jsonl
 
-1. **禁止碰生产 reth 进程 / 生产 datadir / 生产 systemd 服务**。本工单全部在测试节点完成。
-2. **禁止直接把 v2.2.0.local binary 推到生产**。Step 8/9 通过后，进入灰度切流流程（附录 C）。
-3. **禁止跳过 Step 8/9 中的任何子项**。差异条数必须为 0，性能阈值必须满足，缺一不可。
-4. **不要修改 v2.2.0.local 分支的代码**。如发现新问题，记录到 §2B.5 New Issues，
-   由 Opus 评估后决定第三轮。
-5. **链上对照的输入样本**应来自真实生产路径，不要凭空构造。建议从 dural_trade 或
-   go-service 的 path 缓存 dump 取最近 1 小时高频路径。
+# 3) mev_subscribe 用 WS 客户端（websocat / wscat）分别跑 5 个区块的推送
+#    v1 → .2B/phase3/v1_subscribe_<ts>.jsonl
+#    v2 → .2B/phase3/v2_subscribe_<ts>.jsonl
 
-# 完成判定
+# 4) 按 §8.8.3 表格比对
+#    - eth_call:        result bytes 100% 一致
+#    - debug_traceCall: gasUsed + output 100% 一致；accessList 内容相等但顺序可不同（按 §1.4.5 解释）
+#    - trace_call:      output + gasUsed 100% 一致
+#    - subscribe:       block_number/hash/timestamp + changed_raw_ids 集合相等
+#    - -39001.data.gap: 100% 一致
+diff <(jq -S . .2B/phase3/v1_eth_call*.jsonl) <(jq -S . .2B/phase3/v2_eth_call*.jsonl) \
+  | tee .2B/phase3/diff_eth_call.txt
+# 类似处理其他 3 个 method
+```
 
-§2B.4 全部 4 个 Phase 处理记录填完 + 附录 B 数据齐全 + §2B.5 无 🔴 Critical 新 Issue
-→ 触发 §2B.6 review，由 Opus 4.7 复审后标记 ✅ Pass。
+回写 §2B.4 「Phase 3」表 4 行（每个 method 1 行）：
+- 样本数（必须达到 §8.8.2 下限）
+- v1 / v2 log 绝对路径
+- 差异条数（**必须 = 0**；`accessList` 顺序差异不计入）
+- 验收 ✅/❌
+
+**如有任何差异**：把完整的 v1 request/response + v2 request/response（不要节选）
+贴到「差异详情」段，**不允许**写"少量差异"、"3 条不一致可接受"、"差异在小数点后"。
+列差异后立即 §2B.5 创建 I-NEW-XXX 等 Opus 决议，**停下来**。
+
+成功 → 进入 Phase 4。失败 → 按 §8.8.4 失败应对（**仅诊断，不改源码**）+ §2B.5 + 停。
+
+## Phase 4：I-003 Step 9 性能基线对齐
+
+完全按设计文档 §8.9.2 + §8.9.3 操作，配合架构文档 `mev-path-simulation-architecture-v3.md` §8.4。
+
+测试节点专属适配（同一台节点串行，每个 binary 至少跑 30 分钟让 prometheus 数据稳定）：
+
+```bash
+mkdir -p .2B/phase4
+
+# 1) v1.11.3.local 基线
+sudo systemctl stop reth-test-v2
+sudo systemctl start reth-test-v1
+# 触发 1 万条路径 × 10 个区块 × 5 批次（由 DevOps 提供 trigger 工具或脚本）
+sleep 1800   # 至少 30 分钟收集稳态数据
+
+# 2) 收集 v1 指标快照（promql 查询模板见下）
+TS=$(date +%s)
+for q in eth_call_p99 debug_p99 trace_p99 l1_hit_rate db_reads_per_min warmup_p99 block_delay_p99; do
+  echo "Run query for $q manually using the promql templates below, output to .2B/phase4/v1_${q}_${TS}.json"
+done
+
+# 3) 切到 v2.2.0.local 同样跑
+sudo systemctl stop reth-test-v1
+sudo systemctl start reth-test-v2
+sleep 1800
+# 同 7 项指标查询，输出到 .2B/phase4/v2_${q}_<ts>.json
+
+# 4) 计算 Δ% 并对照阈值
+```
+
+promql 查询模板（**严格按下方执行，不要自创**）：
+
+```bash
+# A. method 维度 P99（method 替换为 eth_call / debug_traceCall / trace_call）
+curl -G http://localhost:19001/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.99, sum(rate(mev_e2e_duration_seconds_bucket{method="eth_call"}[5m])) by (le))'
+
+# B. L1 命中率
+curl -G http://localhost:19001/api/v1/query --data-urlencode \
+  'query=rate(mev_worker_l1_hits_total[5m])/(rate(mev_worker_l1_hits_total[5m])+rate(mev_worker_l1_misses_total[5m]))'
+
+# C. db_reads 每分钟增量
+curl -G http://localhost:19001/api/v1/query --data-urlencode \
+  'query=rate(mev_global_cache_db_reads_total[1m])*60'
+
+# D. epoch warmup P99
+curl -G http://localhost:19001/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.99, sum(rate(mev_epoch_warmup_duration_seconds_bucket[5m])) by (le))'
+
+# E. epoch block_delay P99
+curl -G http://localhost:19001/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.99, sum(rate(mev_epoch_block_delay_seconds_bucket[5m])) by (le))'
+
+# 首批 P99 用 rate(...[30s])（首批 5 分钟内的小窗口）；稳态 P99 用 [5m]（30 分钟稳态后）
+```
+
+回写 §2B.4 「Phase 4」表 8 行 + 附录 B 9 行：
+- v1.11.3.local 值 / v2.2.0.local 值 / Δ%（保留 1 位小数）/ 阈值 / 验收 ✅/❌
+- 在每行末尾贴 promql JSON 文件的绝对路径
+
+阈值（**8 项全部满足**才能 Pass）：
+- 稳态 P99（`eth_call` / `debug_traceCall` / `trace_call` 各一）  ≤ 10%
+- 首批 P99（`eth_call`）                                          ≤ 20%
+- `db_reads`/min 增长                                             ≤ 30%
+- L1 hit rate 退步                                                ≤ 1 个百分点（baseline − 1pp）
+- `warmup` P99                                                    ≤ 20%
+- `block_delay` P99                                               ≤ 10%
+
+成功 → §2B.4「填写人 / 完成时间」字段填上自己 + 当前时间戳 → commit + push →
+通知人类启动 §2B.6 Opus review。
+失败 → 按 §8.9.4 失败应对（**仅诊断，不改源码**）+ §2B.5 + 停。
+
+# 进度回写规则
+
+1. **节奏**：每完成 1 个 Phase 立即写 §2B.4 + commit + push。commit message 模板：
+   `docs(mev): §2B Phase {N} {pass|blocked|fail} write-back`
+2. **粒度**：Phase 内部子步骤如果耗时 > 30 分钟，建议中途回写一次"进行中"状态，
+   commit message 后缀 `(in-progress)`。
+3. **占位符**：§2B.4 内**不允许**保留任何 `<待填写>`；任一字段不可得，必须写
+   `N/A：原因 = ...` 而不是空字符串或占位。
+4. **raw 数据**：所有 log / curl response / promql JSON 都归档到测试节点
+   `/opt/build/private_reth/.2B/<phase>/`，**只在表格里贴绝对路径**。不要把 raw 数据塞 _impl.md。
+5. **新 Issue**：发现任何非预期，立即在 §2B.5 创建 I-NEW-NNN，按 5 列填全。
+   严重等级判定：
+   - 🔴 Critical：阻塞 phase 推进、有生产风险、行为差异未查清
+   - 🟠 High：能继续但严重影响验收（如 1 项指标超阈值）
+   - 🟡 Medium：能继续但需要记录（如 P95 增长 8%）
+   - 🔵 Low：观察项（如某条日志格式微变）
+
+# 严禁的"应付"模式（重申，违反 = 工单失败）
+
+| 模式 | 错误示例 | 正确做法 |
+|---|---|---|
+| 跳过样本 | "trace_call 只跑了 10 笔，先把别的跑完" | 按 §8.8.2 下限补齐到 20~50 笔；样本不足则 §2B.5 + 停 |
+| 估算数值 | "P99 约 25 ms" | 完整 promql + curl 命令 + JSON 响应路径 |
+| 差异容忍 | "少量差异在小数点后第 5 位，可接受" | 0 差异；有差异则 §2B.5 记录全部样本，等 Opus 决议 |
+| 静默修复 | "改了一行 worker.rs 就好了" | 严禁；§2B.5 + 停 |
+| 批量回写 | "等 4 个 Phase 都跑完再写" | 严禁；每 Phase 完成立即写 + commit + push |
+| 跳过失败 | "Phase 3 有 2 条差异，先跑 Phase 4" | 严禁；前序 Phase ✗ 整个工单暂停 |
+| 自行 setup | "DevOps 没传 v1 binary 我自己 build 一个" | 严禁；§2B.3 行 4 ⬜ → §2B.5 + 停，等 DevOps |
+
+# 完成条件
+
+满足以下**全部 4 项**：
+1. §2B.4 4 个 Phase 表全部填完（无 `<待填写>`，无空字符串）
+2. 附录 B 9 行性能数据填全
+3. §2B.5 无 🔴 Critical 新 Issue（🟠 / 🟡 / 🔵 可有，但要明确分类）
+4. 整个分支 push 到 origin（最后一次 commit 标记 `§2B all phases complete`）
+
+→ 在 §2B.4 末尾「填写人 / 完成时间」字段写 `Claude Sonnet 4.6` + 时间戳
+→ 通知人类启动 §2B.6 Opus review
+
+**§2B.6 是 Opus 4.7 的工作，不是你的工作**。你只完成执行 + 数据收集。
+
+# 启动确认
+
+收到此 prompt 后，按以下顺序执行（**不要复述任务**）：
+
+1. 读 `_impl.md` §2B.1 / §2B.3 / §2B.4 / §2B.5（你主要在这 4 节里写）
+2. 读设计文档 §8.7 / §8.8 / §8.9 / §11.2 / §11.3
+3. 读 `dt_eks_scripts/.vscode/erigon/reth.service`（环境变量参考，不要执行）
+4. 在测试节点上执行「启动 Checklist」的 6 组命令，结果贴到 §2B.3 对应行
+5. §2B.3 全部 ✅ → commit + push → 开始 Phase 1
+6. 任一项 ✗ → §2B.5 创建 I-NEW-XXX + 停，等 DevOps 补齐
+
+直接开干。
 ````
 
-#### 2B.3 测试节点准备 Checklist
+#### 2B.3 测试节点准备 Checklist（DevOps 人类工作，Sonnet 启动前必须全部 ✅）
 
-| # | 项 | 状态 | 备注 |
+> **谁负责**：DevOps 工程师（人类）。Sonnet **不允许**自行 setup 任一项；任一项 ⬜/未填，Sonnet 必须立即停下来在 §2B.5 创建 I-NEW-XXX 并通知人类。
+> **Sonnet 启动后**：逐项 verify（命令见 §2B.2 prompt 的「启动 Checklist」节），把 ⬜ 改为 ✅/❌ 并在「DevOps 填写」列追加实测结果。
+
+| # | 项 | 状态 | DevOps 填写（路径 / 命令 / 实测值） |
 |---|---|---|---|
-| 1 | 测试节点已分配（机型 / IP / 联系人） | ⬜ | `<DevOps 填写>` |
-| 2 | 磁盘 ≥ 1.5T、内存 ≥ 64G、CPU ≥ 32 vCPU | ⬜ | `<DevOps 填写>` |
-| 3 | mainnet datadir 同步到链头（block_number ≥ 当前 - 1000） | ⬜ | `<DevOps 填写>` |
-| 4 | `/usr/local/bin/reth-v1.11.3.local` 二进制就位（Phase 3 baseline 用） | ⬜ | `<DevOps 填写>` |
-| 5 | systemd 服务模板（与生产对齐） | ⬜ | `<DevOps 填写>` |
-| 6 | prometheus + grafana 看板已连接测试节点 9001 端口 | ⬜ | `<DevOps 填写>` |
-| 7 | 链上对照请求样本就绪（来自生产 path 缓存 dump） | ⬜ | `<DevOps 填写>` |
+| 1 | 测试节点已分配（机型 / IP / 联系人） | ⬜ | `<节点 hostname、IP、负责人>` |
+| 2 | 磁盘 ≥ 1.5T、内存 ≥ 64G、CPU ≥ 32 vCPU | ⬜ | `<df -h / free -g / nproc 实测输出>` |
+| 3 | mainnet datadir 同步到链头（`block_number ≥ 当前 − 1000`） | ⬜ | `<datadir 绝对路径（记为 $TESTNET_DATADIR）+ 当前 block_number 实测>` |
+| 4 | `/usr/local/bin/reth-v1.11.3.local` 二进制就位（Phase 3 baseline 用） | ⬜ | `<reth-v1.11.3.local --version 输出，含 Commit SHA>` |
+| 5 | systemd 服务模板（与生产对齐，端口避开生产 8545/8546/8551/9001/9002） | ⬜ | `<reth-test-v1.service / reth-test-v2.service 路径；端口约定 18545/18546/18551/19001/IPC=/opt/reth-test-ipc/reth.ipc>` |
+| 6 | prometheus 端口可达（测试节点 19001 而非生产 9001/9002） | ⬜ | `<curl -fsS http://localhost:19001/metrics 实测前 5 行>` |
+| 7 | 链上对照请求样本就绪（≥ 100 / 50 / 20 行的 3 个 jsonl 文件，来自生产 path 缓存 dump） | ⬜ | `<$SAMPLE_DIR 绝对路径 + ls + wc -l 输出，3 个文件名固定为 eth_call.jsonl / debug_traceCall.jsonl / trace_call.jsonl>` |
 
-#### 2B.4 处理记录（由 DevOps + Sonnet 4.6 协作填写）
+#### 2B.4 处理记录（由 Sonnet 4.6 实时回写，DevOps 提供前置条件与节点）
 
-> 状态：⬜ 待开始
+> 状态：⬜ 待开始（由 Sonnet 4.6 按 §2B.2 prompt 推进；每完成 1 个 Phase 立即 commit + push）
 
 ##### Phase 1：I-005 Binary Rebuild
 
@@ -666,10 +937,10 @@ baseline，**再**切换到 v2.2.0.local 跑同一组请求做对照。
 
 详细数据归档：`<grafana dashboard 截图 / promql 查询 / raw csv 路径>`
 
-填写人：`<待填写：DevOps + Sonnet 4.6>`
-完成时间：`<待填写>`
+填写人：`<待填写：Claude Sonnet 4.6>`
+完成时间：`<待填写：UTC+8>`
 
-#### 2B.5 New Issues（DevOps 在执行过程中发现的）
+#### 2B.5 New Issues（Sonnet 4.6 实施过程中发现 + DevOps 前置阻塞登记）
 
 | Issue ID | 严重 | Phase | 描述 | 处理方式 |
 |---|---|---|---|---|

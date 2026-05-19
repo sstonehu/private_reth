@@ -91,7 +91,7 @@ where
         method: &'static str,
         start: Instant,
     ) {
-        metrics::histogram!(metric, "method" => method).record(start.elapsed().as_secs_f64());
+        ::metrics::histogram!(metric, "method" => method).record(start.elapsed().as_secs_f64());
     }
 }
 
@@ -404,14 +404,14 @@ struct ApiInflightGuard {
 
 impl ApiInflightGuard {
     fn new(method: &'static str) -> Self {
-        metrics::gauge!("mev_api_inflight", "method" => method).increment(1.0);
+        ::metrics::gauge!("mev_api_inflight", "method" => method).increment(1.0);
         Self { method }
     }
 }
 
 impl Drop for ApiInflightGuard {
     fn drop(&mut self) {
-        metrics::gauge!("mev_api_inflight", "method" => self.method).decrement(1.0);
+        ::metrics::gauge!("mev_api_inflight", "method" => self.method).decrement(1.0);
     }
 }
 

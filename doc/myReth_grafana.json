@@ -3456,9 +3456,18 @@
           "expr": "reth_mev_worker_handle_seconds{quantile=\"0.99\"} * 1000",
           "legendFormat": "{{method}}/{{kind}} handle P99",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "reth_mev_worker_recv_seconds{backlog=\"yes\",quantile=\"0.99\"} * 1000",
+          "legendFormat": "recv P99 when backlog",
+          "refId": "C"
         }
       ],
-      "title": "Worker Queue Wait vs Handle P99（是否真在排队）",
+      "title": "Worker Queue Wait / Recv / Handle P99（定位取队列瓶颈）",
       "type": "timeseries"
     },
     {

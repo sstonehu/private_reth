@@ -117,6 +117,7 @@ pub struct WorkerTask {
 
 | 指标 | 类型 | 标签 | 含义 |
 |------|------|------|------|
+| `mev_worker_recv_seconds` | Histogram | `backlog` | worker `recv()` 耗时；`backlog=yes` 表示 `recv` 前队列已有积压，用于判断队列消费/调度是否卡住 |
 | `mev_worker_queue_wait_seconds` | Histogram | `method`, `kind` | task 入队到 worker `recv()` 后开始处理的等待时间 |
 | `mev_pool_queue_depth` | Gauge | 无 | 现有队列深度，保留 |
 | `mev_pool_queue_full_total` | Counter | 无 | 现有队列满计数，保留 |
@@ -127,7 +128,7 @@ pub struct WorkerTask {
 - `debug_trace`
 - `trace_call`
 
-**注意**：现有 `mev_pool_queue_depth` 是 dispatch 时的瞬时值，容易漏掉高频尖峰；`mev_worker_queue_wait_seconds` 是 per-task 直接证据。
+**注意**：现有 `mev_pool_queue_depth` 会在 dispatch 和 worker recv 后刷新，`mev_worker_queue_wait_seconds` 是 per-task 排队直接证据。若 `mev_worker_recv_seconds{backlog="yes"}` 在队列有积压时也明显升高，才更支持 worker 取队列 / 调度 / channel 侧存在瓶颈。
 
 ### 4.3 Worker 执行总览
 
@@ -266,6 +267,7 @@ pub fn dec_gauge(name: &'static str, labels: &[(&'static str, &'static str)]);
 | API in-flight | `mev_api_inflight{method="eth_call"}` | 判断 IPC/API 层是否堆积 |
 | API 分段 p99 | `mev_api_prepare/dispatch/worker_await/return_seconds{quantile="0.99"}` | 定位 handler 内部卡点 |
 | Worker active | `sum(mev_worker_active) by (method, kind)` | 判断 60 worker 是否占满 |
+| Worker recv p99 | `mev_worker_recv_seconds{backlog="yes",quantile="0.99"}` | 队列已有积压时，判断 worker 从队列取任务是否卡住 |
 | Worker queue wait p99 | `mev_worker_queue_wait_seconds{quantile="0.99"}` | 直接证明 worker queue 排队 |
 | Worker exec 分段 p99 | `mev_worker_*_seconds{quantile="0.99"}` | 定位 switch/nonce/transact/flush/result |
 | Provider source p99 | `mev_provider_op_seconds{quantile="0.99"}` by `op,source` | 区分 L1/global/DB |

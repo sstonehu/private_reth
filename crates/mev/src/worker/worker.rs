@@ -64,7 +64,17 @@ impl MevWorker {
     }
 
     fn run(&mut self) {
-        while let Ok(task) = self.task_rx.recv() {
+        loop {
+            let queue_before_recv = self.task_rx.len();
+            let backlog = if queue_before_recv > 0 { "yes" } else { "no" };
+            let recv_start = Instant::now();
+            let Ok(task) = self.task_rx.recv() else {
+                break;
+            };
+            metrics::histogram!("mev_worker_recv_seconds", "backlog" => backlog)
+                .record(recv_start.elapsed().as_secs_f64());
+            metrics::gauge!("mev_pool_queue_depth").set(self.task_rx.len() as f64);
+
             let kind = task.kind.label();
             metrics::histogram!(
                 "mev_worker_queue_wait_seconds",

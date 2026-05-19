@@ -85,6 +85,14 @@ where
         request.take_nonce();
         (evm_env, request)
     }
+
+    fn record_api_duration(
+        metric: &'static str,
+        method: &'static str,
+        start: Instant,
+    ) {
+        metrics::histogram!(metric, "method" => method).record(start.elapsed().as_secs_f64());
+    }
 }
 
 #[async_trait::async_trait]
@@ -114,6 +122,7 @@ where
     ) -> RpcResult<Bytes> {
         let t0 = Instant::now();
         let c = &self.counters.eth_call;
+        let _inflight = ApiInflightGuard::new(method::ETH_CALL);
         metrics::record_request(method::ETH_CALL, c);
 
         if !self.epoch_manager.matches_active(block_id) {
@@ -140,10 +149,12 @@ where
         }
 
         metrics::record_worker_path(method::ETH_CALL, c);
+        let prepare_start = Instant::now();
         let epoch = self.epoch_manager.current();
         let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
             self.eth_api.converter().tx_env(prepared_request, &evm_env).map_err(Into::into)?;
+        Self::record_api_duration("mev_api_prepare_seconds", method::ETH_CALL, prepare_start);
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let task = WorkerTask {
@@ -153,12 +164,21 @@ where
             block_overrides,
             state_overrides,
             kind: CallKind::Basic,
+            enqueued_at: Instant::now(),
+            method: method::ETH_CALL,
             result_tx,
         };
 
+        let dispatch_start = Instant::now();
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
+        Self::record_api_duration("mev_api_dispatch_seconds", method::ETH_CALL, dispatch_start);
 
-        let result = match result_rx.await {
+        let await_start = Instant::now();
+        let worker_result = result_rx.await;
+        Self::record_api_duration("mev_api_worker_await_seconds", method::ETH_CALL, await_start);
+
+        let return_start = Instant::now();
+        let result = match worker_result {
             Ok(Ok(WorkerOutput::Basic(bytes))) => Ok(bytes),
             Ok(Err(WorkerError::Revert(data))) => Err(EthApiError::from_revert(data).into()),
             Ok(Err(err)) => {
@@ -171,6 +191,7 @@ where
             }
             _ => Err(internal_rpc_err("unexpected worker output")),
         };
+        Self::record_api_duration("mev_api_return_seconds", method::ETH_CALL, return_start);
         metrics::record_e2e_latency(method::ETH_CALL, t0.elapsed());
         result
     }
@@ -183,6 +204,7 @@ where
     ) -> RpcResult<serde_json::Value> {
         let t0 = Instant::now();
         let c = &self.counters.debug_trace_call;
+        let _inflight = ApiInflightGuard::new(method::DEBUG_TRACE);
         metrics::record_request(method::DEBUG_TRACE, c);
 
         if !self.epoch_manager.matches_active(block_id) {
@@ -222,10 +244,12 @@ where
         let state_overrides = inner_opts.state_overrides.clone();
         let block_overrides = inner_opts.block_overrides.clone().map(Box::new);
 
+        let prepare_start = Instant::now();
         let epoch = self.epoch_manager.current();
         let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
             self.eth_api.converter().tx_env(prepared_request, &evm_env).map_err(Into::into)?;
+        Self::record_api_duration("mev_api_prepare_seconds", method::DEBUG_TRACE, prepare_start);
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let task = WorkerTask {
@@ -235,12 +259,21 @@ where
             block_overrides,
             state_overrides,
             kind: CallKind::DebugTrace { opts: Box::new(inner_opts), with_access_list },
+            enqueued_at: Instant::now(),
+            method: method::DEBUG_TRACE,
             result_tx,
         };
 
+        let dispatch_start = Instant::now();
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
+        Self::record_api_duration("mev_api_dispatch_seconds", method::DEBUG_TRACE, dispatch_start);
 
-        let result = match result_rx.await {
+        let await_start = Instant::now();
+        let worker_result = result_rx.await;
+        Self::record_api_duration("mev_api_worker_await_seconds", method::DEBUG_TRACE, await_start);
+
+        let return_start = Instant::now();
+        let result = match worker_result {
             Ok(Ok(WorkerOutput::DebugTrace(trace, opt_al))) => {
                 let mut json =
                     serde_json::to_value(&trace).map_err(|e| internal_rpc_err(e.to_string()))?;
@@ -261,6 +294,7 @@ where
             }
             _ => Err(internal_rpc_err("unexpected worker output")),
         };
+        Self::record_api_duration("mev_api_return_seconds", method::DEBUG_TRACE, return_start);
         metrics::record_e2e_latency(method::DEBUG_TRACE, t0.elapsed());
         result
     }
@@ -275,6 +309,7 @@ where
     ) -> RpcResult<TraceResults> {
         let t0 = Instant::now();
         let c = &self.counters.trace_call;
+        let _inflight = ApiInflightGuard::new(method::TRACE_CALL);
         metrics::record_request(method::TRACE_CALL, c);
 
         let trace_types: HashSet<_> = trace_types.into_iter().collect();
@@ -315,10 +350,12 @@ where
         }
 
         metrics::record_worker_path(method::TRACE_CALL, c);
+        let prepare_start = Instant::now();
         let epoch = self.epoch_manager.current();
         let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
             self.eth_api.converter().tx_env(prepared_request, &evm_env).map_err(Into::into)?;
+        Self::record_api_duration("mev_api_prepare_seconds", method::TRACE_CALL, prepare_start);
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let task = WorkerTask {
@@ -328,12 +365,21 @@ where
             block_overrides,
             state_overrides,
             kind: CallKind::ParityTrace { trace_types },
+            enqueued_at: Instant::now(),
+            method: method::TRACE_CALL,
             result_tx,
         };
 
+        let dispatch_start = Instant::now();
         self.worker_pool.dispatch(task).map_err(|err| internal_rpc_err(err.to_string()))?;
+        Self::record_api_duration("mev_api_dispatch_seconds", method::TRACE_CALL, dispatch_start);
 
-        let result = match result_rx.await {
+        let await_start = Instant::now();
+        let worker_result = result_rx.await;
+        Self::record_api_duration("mev_api_worker_await_seconds", method::TRACE_CALL, await_start);
+
+        let return_start = Instant::now();
+        let result = match worker_result {
             Ok(Ok(WorkerOutput::ParityTrace(trace))) => Ok(trace),
             Ok(Err(err)) => {
                 metrics::record_error(method::TRACE_CALL, "worker_error", c);
@@ -345,12 +391,29 @@ where
             }
             _ => Err(internal_rpc_err("unexpected worker output")),
         };
+        Self::record_api_duration("mev_api_return_seconds", method::TRACE_CALL, return_start);
         metrics::record_e2e_latency(method::TRACE_CALL, t0.elapsed());
         result
     }
 
 }
 
+struct ApiInflightGuard {
+    method: &'static str,
+}
+
+impl ApiInflightGuard {
+    fn new(method: &'static str) -> Self {
+        metrics::gauge!("mev_api_inflight", "method" => method).increment(1.0);
+        Self { method }
+    }
+}
+
+impl Drop for ApiInflightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("mev_api_inflight", "method" => self.method).decrement(1.0);
+    }
+}
 
 /// 构造 -39001 EpochMismatch JSON-RPC 错误，供 Phase 4 快速拒绝使用。
 fn epoch_mismatch_error(

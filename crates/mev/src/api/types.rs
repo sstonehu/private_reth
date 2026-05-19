@@ -31,6 +31,16 @@ pub enum CallKind {
     ParityTrace { trace_types: HashSet<TraceType> },
 }
 
+impl CallKind {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::DebugTrace { .. } => "debug_trace",
+            Self::ParityTrace { .. } => "trace_call",
+        }
+    }
+}
+
 /// `mev_subscribe("newBlock")` 推送给订阅者的每块数据。
 ///
 /// `changed_raw_ids` 是当前 block 中价格可能变动的 pool 标识集合（原始格式），

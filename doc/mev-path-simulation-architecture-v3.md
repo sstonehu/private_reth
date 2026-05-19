@@ -41,13 +41,14 @@ Layer B：共享跨请求读缓存（消除重复 DB 读）
 Layer C：批量 IPC 接口（消除 RPC 调用次数 + 编解码开销）
 ```
 
-对应五个实施阶段：
+对应六个实施阶段：
 
 - **Phase 1**：实现 Layer A，新增 `mev_eth_call` / `mev_debug_traceCall` / `mev_trace_call`，沿用 JSON-RPC batch 传输
 - **Phase 2**：实现 Layer B，在 Phase 1 基础上叠加全局读缓存（GlobalSharedCache + CachedStateProvider + singleflight）
 - **Phase 3**：精确 Diff 缓存失效，切块后命中率从 SafeUnchangedSet 覆盖率提升至近 100%，首批延迟趋近稳态
 - **Phase 4**：`mev_eth_call` 过期请求快速拒绝（-39001 错误码），切断级联故障的正反馈回路
 - **Phase 5**：`mev_debug_traceCall` 扩展 `withAccessList` 可选参数，零开销获取 EIP-2930 access list，供上链 tx 降低 cold slot gas 开销
+- **Phase 6**：补齐 Worker / IPC / Provider 分段指标，定位高流量下 wall-clock 延迟卡点（IPC ingress、worker queue、EVM 执行、cache/DB、结果返回）
 - **待规划**：新增自定义 IPC 批量接口（`mev_callBatch` / `mev_callBundleBatch`），替代 JSON-RPC batch
 
 ---
@@ -594,6 +595,31 @@ flowchart LR
 - trace gap=1 请求进入 worker 路径，延迟与正常请求相同
 - `mev_epoch_mismatch_total{reason="stale"}` 在流量激增时不触发级联
 - Bot 侧正确处理 `-39001` 错误，不重试旧 `block_id`
+
+---
+
+### Phase 6：Worker / IPC 卡点分解指标（1~2 天）
+
+> 📄 **详细设计文档**：[Reth_simulate_optimize_phase6.md](./Reth_simulate_optimize_phase6.md)
+
+**目标**：在不先扩大 `MEV_WORKER_COUNT` 的前提下，将 `mev_*` 请求的 wall-clock 延迟拆解到 IPC/RPC ingress、API handler、worker queue、worker 执行、Provider/cache/DB、结果返回路径，明确高流量下 worker CPU 低但 E2E p99 升高的真实卡点。
+
+**实施内容**
+
+- `server.rs`：新增 API 层分段指标：`mev_api_inflight`、`mev_api_prepare_seconds`、`mev_api_dispatch_seconds`、`mev_api_worker_await_seconds`、`mev_api_return_seconds`
+- `worker/mod.rs`：`WorkerTask` 增加 `enqueued_at` 与 `method` 元数据，用于计算 per-task queue wait
+- `worker/worker.rs`：新增 worker 层分段指标：`mev_worker_queue_wait_seconds`、`mev_worker_active`、`mev_worker_handle_seconds`、`mev_worker_execute_seconds`、`mev_worker_result_send_seconds`
+- `worker/worker.rs`：细拆 `execute_task()` 内部阶段：`switch_epoch`、`build_db`、`apply_overrides`、`nonce_basic`、`transact`、`trace_build`、`stats_flush`
+- `provider.rs`：新增 `mev_provider_op_seconds{op,source}` 与 `mev_provider_access_total{op,source}`，区分 `l1_hit`、`global_or_singleflight`、`db_read`
+- Grafana：新增 "MEV Worker / IPC Breakdown" 行，与现有 `reth_rpc_server_connections_request_time_seconds{transport="ipc"}` 同屏对照
+
+**验收**
+
+- 高流量窗口内能明确判断卡点属于 IPC/API、worker queue、worker execute、provider/cache/DB、result return 中的哪一类。
+- `mev_api_worker_await_seconds.p99` 能被 `worker_queue_wait + worker_handle` 解释。
+- `worker_handle` 能被 `switch_epoch + execute_task + result_send` 解释。
+- `execute_task` 的主要耗时能被 `nonce_basic / transact / trace_build / stats_flush / provider_op` 解释。
+- 开启 Phase 6 指标后，正常流量下 CPU 和 `eth_call p99` 没有可观测恶化。
 
 ---
 

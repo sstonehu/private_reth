@@ -8,7 +8,7 @@ use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides};
 use alloy_rpc_types_trace::{geth::GethTrace, parity::TraceResults};
 use crossbeam_channel::{bounded, Sender};
 use reth_evm_ethereum::EthEvmConfig;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 use tokio::sync::oneshot;
 pub use worker::MevWorker;
 
@@ -32,6 +32,8 @@ pub struct WorkerTask {
     pub block_overrides: Option<Box<BlockOverrides>>,
     pub state_overrides: Option<StateOverride>,
     pub kind: CallKind,
+    pub enqueued_at: Instant,
+    pub method: &'static str,
     pub result_tx: oneshot::Sender<WorkerResult>,
 }
 

@@ -12,6 +12,7 @@ use alloy_rpc_types_trace::{
     tracerequest::TraceCallRequest,
 };
 use jsonrpsee::core::RpcResult;
+use reth_evm::env::BlockEnvironment;
 use reth_rpc_convert::{RpcConvert, RpcTypes};
 use reth_rpc_eth_api::{
     helpers::{EthCall, EthTransactions, TraceExt},
@@ -65,8 +66,21 @@ where
         &self,
         epoch: &EpochContext,
         mut request: TransactionRequest,
+        block_overrides: Option<&BlockOverrides>,
     ) -> (reth_evm::EvmEnvFor<reth_evm_ethereum::EthEvmConfig>, TransactionRequest) {
         let mut evm_env = epoch.block_env.clone();
+
+        // Apply fee-relevant block overrides BEFORE `converter().tx_env`.
+        // `CallFees::ensure_fees` validates maxFeePerGas against block_env.basefee.
+        // Native `prepare_call_env` applies overrides first; the MEV worker path used
+        // to convert tx_env against the epoch basefee and only later apply overrides
+        // in the worker, which rejected pending EIP-1559 txs whose maxFee sits between
+        // baseFeeNext (override) and the current baseFee.
+        if let Some(overrides) = block_overrides {
+            if let Some(base_fee) = overrides.base_fee {
+                evm_env.block_env.inner_mut().basefee = base_fee.saturating_to();
+            }
+        }
 
         evm_env.cfg_env.disable_block_gas_limit = true;
         evm_env.cfg_env.disable_eip3607 = true;
@@ -151,7 +165,8 @@ where
         metrics::record_worker_path(method::ETH_CALL, c);
         let prepare_start = Instant::now();
         let epoch = self.epoch_manager.current();
-        let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
+        let (evm_env, prepared_request) =
+            self.prepare_evm_env(&epoch, request, block_overrides.as_deref());
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
             self.eth_api.converter().tx_env(prepared_request, &evm_env).map_err(Into::into)?;
         Self::record_api_duration("mev_api_prepare_seconds", method::ETH_CALL, prepare_start);
@@ -246,7 +261,8 @@ where
 
         let prepare_start = Instant::now();
         let epoch = self.epoch_manager.current();
-        let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
+        let (evm_env, prepared_request) =
+            self.prepare_evm_env(&epoch, request, block_overrides.as_deref());
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
             self.eth_api.converter().tx_env(prepared_request, &evm_env).map_err(Into::into)?;
         Self::record_api_duration("mev_api_prepare_seconds", method::DEBUG_TRACE, prepare_start);
@@ -352,7 +368,8 @@ where
         metrics::record_worker_path(method::TRACE_CALL, c);
         let prepare_start = Instant::now();
         let epoch = self.epoch_manager.current();
-        let (evm_env, prepared_request) = self.prepare_evm_env(&epoch, request);
+        let (evm_env, prepared_request) =
+            self.prepare_evm_env(&epoch, request, block_overrides.as_deref());
         let tx_env: reth_evm::TxEnvFor<reth_evm_ethereum::EthEvmConfig> =
             self.eth_api.converter().tx_env(prepared_request, &evm_env).map_err(Into::into)?;
         Self::record_api_duration("mev_api_prepare_seconds", method::TRACE_CALL, prepare_start);
